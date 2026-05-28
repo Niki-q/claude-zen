@@ -594,10 +594,21 @@ if (!chrome.sidePanel) {
   };
 }
 
-// ── chrome.offscreen → no-op stubs ────────────────────────────────────────────
+// ── chrome.offscreen → handled inline in the Firefox background page ───────────
+// Chrome needs an offscreen document because its MV3 service worker has no DOM
+// (no Audio, canvas, Image, URL.createObjectURL). The bundle uses offscreen.js
+// for notification-sound playback and GIF generation (the /share flow).
+// Firefox's MV3 background is a real event PAGE with full DOM, so no offscreen
+// document is needed — offscreen.js + gif.js are loaded directly into the
+// background page (see manifest background.scripts). We report hasDocument:true
+// so the bundle skips creation and just posts its OFFSCREEN_PLAY_SOUND /
+// GENERATE_GIF / REVOKE_BLOB_URL messages, which offscreen.js's onMessage
+// listener handles in the background. Messages the bundle sends FROM the
+// background itself don't loop back via runtime.sendMessage (same context), so
+// the sendMessage wrapper below dispatches those straight to the handlers.
 if (!chrome.offscreen) {
   chrome.offscreen = {
-    hasDocument:    async () => false,
+    hasDocument:    async () => true,
     createDocument: async () => {},
     closeDocument:  async () => {},
     Reason: {
@@ -608,6 +619,36 @@ if (!chrome.offscreen) {
       MATCH_MEDIA: 'MATCH_MEDIA',       TESTING: 'TESTING',
       USER_MEDIA: 'USER_MEDIA',         WORKERS: 'WORKERS',
     },
+  };
+}
+
+// ── Offscreen-message loopback: dispatch background→background sends directly ──
+// runtime.sendMessage does not deliver to listeners in the same context, so when
+// the bundle (running in the background page) posts an offscreen message, the
+// offscreen.js listener in that same page never sees it. Intercept those types
+// at send time and call the handlers offscreen.js exposes as page globals.
+// Other contexts (sidepanel) lack the handlers, fall through, and reach the
+// background's offscreen.js listener cross-context as usual.
+if (chrome.runtime && typeof chrome.runtime.sendMessage === 'function') {
+  const _send = chrome.runtime.sendMessage.bind(chrome.runtime);
+  const OFFSCREEN_TYPES = new Set(['OFFSCREEN_PLAY_SOUND', 'GENERATE_GIF', 'REVOKE_BLOB_URL']);
+  const hasHandlers = () => typeof window !== 'undefined' && typeof window.generateGif === 'function';
+  const handle = async (m) => {
+    try {
+      if (m.type === 'OFFSCREEN_PLAY_SOUND') { await window.playAudioWithWebAudioAPI(m.audioUrl, m.volume ?? 0.5); return { success: true }; }
+      if (m.type === 'GENERATE_GIF')         { return { success: true, result: await window.generateGif(m.frames, m.options) }; }
+      if (m.type === 'REVOKE_BLOB_URL')      { URL.revokeObjectURL(m.blobUrl); return { success: true }; }
+    } catch (e) { return { success: false, error: e?.message }; }
+  };
+  chrome.runtime.sendMessage = function (...args) {
+    const m = args[0];
+    const cb = typeof args[args.length - 1] === 'function' ? args[args.length - 1] : undefined;
+    if (m && typeof m === 'object' && OFFSCREEN_TYPES.has(m.type) && hasHandlers()) {
+      const p = handle(m);
+      if (cb) { p.then(cb, () => cb(undefined)); return; }
+      return p;
+    }
+    return _send(...args);
   };
 }
 
