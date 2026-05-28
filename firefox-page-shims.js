@@ -292,15 +292,157 @@ if (!chrome.tabGroups) {
   };
 }
 
-// ── chrome.debugger (absent in Firefox) ───────────────────────────────────────
-// Page-automation features rely on this and will not work, but stubbing lets the
-// bundle load. registerDebuggerEventHandlers() reads chrome.debugger.onEvent on init.
+// ── chrome.debugger (absent in Firefox) → translate CDP to Firefox APIs ───────
+// The bundle drives page automation (click/type/screenshot/evaluate) through the
+// Chrome DevTools Protocol via chrome.debugger.sendCommand. Firefox has no
+// debugger API, so we translate the CDP commands the bundle actually uses into
+// Firefox equivalents:
+//   Input.dispatchMouseEvent/dispatchKeyEvent/insertText → synthetic DOM events
+//     injected into the page MAIN world via scripting.executeScript
+//   Page.captureScreenshot                               → tabs.captureVisibleTab
+//   Runtime.evaluate                                     → executeScript (MAIN)
+//   *.enable / *.disable                                 → no-op {}
+//   attach / detach / getTargets                         → no-op (report attached)
+// CDP event domains (Network.*, Page.frameNavigated, Runtime.consoleAPICalled…)
+// have no Firefox analogue and never fire — onEvent is a no-op listener, so
+// network/console monitoring degrades gracefully instead of crashing.
+// Limitation: synthetic events are untrusted (isTrusted=false); elements that
+// gate on trusted input may ignore them.
 if (!chrome.debugger) {
+  const __ffApi = (typeof browser !== 'undefined' ? browser : chrome);
+
+  // Runs `func(...args)` in the target tab's page (MAIN) world and returns its result.
+  const __ffExec = async (tabId, func, args) => {
+    if (!__ffApi.scripting || tabId == null) throw new Error('scripting unavailable');
+    const res = await __ffApi.scripting.executeScript({
+      target: { tabId }, world: 'MAIN', func, args: args || [],
+    });
+    return res && res[0] ? res[0].result : undefined;
+  };
+
+  // ── Injected page-world helpers (self-contained — serialized by executeScript) ──
+  const __ffMouse = (p) => {
+    const x = p.x, y = p.y, m = p.modifiers || 0;
+    const el = document.elementFromPoint(x, y) || document.body;
+    const button = { left: 0, middle: 1, right: 2, none: 0 }[p.button] ?? 0;
+    const base = {
+      bubbles: true, cancelable: true, composed: true, view: window,
+      clientX: x, clientY: y, screenX: x, screenY: y,
+      altKey: !!(m & 1), ctrlKey: !!(m & 2), metaKey: !!(m & 4), shiftKey: !!(m & 8),
+      button, buttons: p.buttons || 0, detail: p.clickCount || 1,
+    };
+    const fire = (t) => el.dispatchEvent(new MouseEvent(t, base));
+    switch (p.type) {
+      case 'mouseMoved': fire('mousemove'); break;
+      case 'mousePressed': if (el.focus) try { el.focus(); } catch {} fire('mousedown'); break;
+      case 'mouseReleased': fire('mouseup'); fire('click'); break;
+      case 'mouseWheel':
+        el.dispatchEvent(new WheelEvent('wheel', { ...base, deltaX: p.deltaX || 0, deltaY: p.deltaY || 0 }));
+        break;
+    }
+    return true;
+  };
+
+  const __ffKey = (p) => {
+    const el = document.activeElement || document.body;
+    const m = p.modifiers || 0;
+    const type = p.type === 'keyUp' ? 'keyup' : 'keydown';
+    el.dispatchEvent(new KeyboardEvent(type, {
+      bubbles: true, cancelable: true, composed: true, view: window,
+      key: p.key || '', code: p.code || '',
+      keyCode: p.windowsVirtualKeyCode || 0, which: p.windowsVirtualKeyCode || 0,
+      altKey: !!(m & 1), ctrlKey: !!(m & 2), metaKey: !!(m & 4), shiftKey: !!(m & 8),
+    }));
+    // Backspace/Delete in editable targets have no default action for synthetic
+    // events — emulate the edit so the bundle's key-based deletes still work.
+    if (type === 'keydown' && el.isContentEditable) {
+      if (p.key === 'Backspace') { try { document.execCommand('delete'); } catch {} }
+      else if (p.key === 'Delete') { try { document.execCommand('forwardDelete'); } catch {} }
+    }
+    return true;
+  };
+
+  const __ffInsertText = (text) => {
+    const el = document.activeElement;
+    if (!el) return false;
+    if (el.isContentEditable) {
+      try { document.execCommand('insertText', false, text); return true; } catch {}
+    }
+    if ('value' in el) {
+      // Use the native value setter so React's onChange tracking fires.
+      const proto = el instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+      const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+      const s = el.selectionStart ?? el.value.length, e = el.selectionEnd ?? el.value.length;
+      const next = el.value.slice(0, s) + text + el.value.slice(e);
+      if (setter) setter.call(el, next); else el.value = next;
+      const pos = s + text.length;
+      try { el.setSelectionRange(pos, pos); } catch {}
+      el.dispatchEvent(new InputEvent('input', { bubbles: true, composed: true, data: text, inputType: 'insertText' }));
+      el.dispatchEvent(new Event('change', { bubbles: true }));
+      return true;
+    }
+    try { document.execCommand('insertText', false, text); return true; } catch {}
+    return false;
+  };
+
+  const __ffEval = (expr) => {
+    // eslint-disable-next-line no-eval
+    return (0, eval)(expr);
+  };
+
+  const __ffSend = async (target, method, params = {}) => {
+    const tabId = target && target.tabId;
+    switch (method) {
+      case 'Runtime.enable':
+      case 'Page.enable':
+      case 'Network.enable':
+      case 'Network.disable':
+      case 'DOM.enable':
+      case 'Page.handleJavaScriptDialog':
+        return {};
+
+      case 'Page.captureScreenshot': {
+        const tab = await __ffApi.tabs.get(tabId);
+        const dataUrl = await __ffApi.tabs.captureVisibleTab(tab.windowId, {
+          format: params.format === 'jpeg' ? 'jpeg' : 'png',
+          ...(params.quality != null ? { quality: params.quality } : {}),
+        });
+        return { data: String(dataUrl).replace(/^data:image\/\w+;base64,/, '') };
+      }
+
+      case 'Input.dispatchMouseEvent':
+        await __ffExec(tabId, __ffMouse, [params]);
+        return {};
+      case 'Input.dispatchKeyEvent':
+        await __ffExec(tabId, __ffKey, [params]);
+        return {};
+      case 'Input.insertText':
+        await __ffExec(tabId, __ffInsertText, [params.text]);
+        return {};
+
+      case 'Runtime.evaluate': {
+        const value = await __ffExec(tabId, __ffEval, [params.expression]);
+        return { result: { type: typeof value, value } };
+      }
+
+      default:
+        console.warn('[claude-zen] CDP command not implemented in Firefox:', method);
+        return {};
+    }
+  };
+
   chrome.debugger = {
-    attach:      async () => { throw new Error('chrome.debugger not supported in Firefox'); },
-    detach:      async () => {},
-    sendCommand: async () => { throw new Error('chrome.debugger not supported in Firefox'); },
-    getTargets:  async () => [],
+    // attach/detach/getTargets are invoked callback-style by the bundle
+    // (rawAttach does chrome.debugger.attach({tabId},"1.3",cb) inside a
+    // Promise.race) — the callback MUST fire or every command stalls.
+    attach:     (target, version, cb) => { if (typeof cb === 'function') cb(); return Promise.resolve(); },
+    detach:     (target, cb)          => { if (typeof cb === 'function') cb(); return Promise.resolve(); },
+    getTargets: (cb)                  => { if (typeof cb === 'function') cb([]); return Promise.resolve([]); },
+    sendCommand: (target, method, params, cb) => {
+      const p = __ffSend(target, method, params);
+      if (typeof cb === 'function') { p.then((r) => cb(r), () => cb(undefined)); return; }
+      return p;
+    },
     onEvent:  { addListener: () => {}, removeListener: () => {}, hasListener: () => false },
     onDetach: { addListener: () => {}, removeListener: () => {}, hasListener: () => false },
   };
@@ -319,9 +461,16 @@ if (!chrome.sidePanel) {
     setOptions: async (opts) => {
       try {
         if (opts && opts.path && browser.sidebarAction && browser.sidebarAction.setPanel) {
-          const details = { panel: opts.path };
-          if (opts.tabId != null) details.tabId = opts.tabId;
-          await browser.sidebarAction.setPanel(details);
+          // IMPORTANT: set a GLOBAL panel (no tabId), unlike Chrome's per-tab
+          // sidepanel model. Firefox has a single sidebar shared across tabs; if
+          // we bind the panel to one tabId, switching to any other tab makes
+          // Firefox fall back to the default panel URL (no ?tabId) and RELOAD the
+          // sidebar document — re-initializing the whole bundle and wiping the
+          // in-progress conversation. A single global panel URL stays constant
+          // across tab switches, so the document is kept alive and state persists.
+          // The target tabId still reaches the bundle via the deferred-module
+          // loader (history.replaceState ?tabId=N + URLSearchParams.get patch).
+          await browser.sidebarAction.setPanel({ panel: opts.path });
         }
       } catch {}
     },
