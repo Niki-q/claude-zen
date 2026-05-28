@@ -259,38 +259,151 @@ if (typeof document !== 'undefined' &&
   })();
 }
 
-// ── chrome.tabs.group / ungroup (absent in Firefox 128) ───────────────────────
-// Tab grouping is Chrome-only. The bundle's orchestration calls these; most
-// call sites are try/catch-wrapped, but an undefined function would still throw
-// a TypeError. Provide stubs so grouping degrades to a no-op instead of crashing
-// the surrounding operation.
-if (chrome.tabs) {
-  if (typeof chrome.tabs.group !== 'function') {
-    chrome.tabs.group = async () => { throw new Error('tabs.group not supported in Firefox'); };
-  }
-  if (typeof chrome.tabs.ungroup !== 'function') {
-    chrome.tabs.ungroup = async () => {};
-  }
-}
+// ── Tab Groups emulation (Firefox has no chrome.tabGroups / tabs.group) ───────
+// Chrome's bundle uses real OS tab groups to corral the tabs Claude drives, and
+// re-finds them on invoke via tabs.query({groupId}) / tab.groupId / tabGroups.*.
+// Firefox 128 has no grouping API, so without this the group is lost on every
+// invocation and Claude can't see "its" tabs. We emulate a LOGICAL group: a
+// registry kept in storage.session (shared across background + sidepanel,
+// survives SW unload, cleared on browser restart) mapping tabId→groupId plus
+// per-group metadata. There is no visual group in the Firefox UI, but every API
+// the bundle relies on behaves consistently, so the orchestration works.
+(function () {
+  const api = (typeof browser !== 'undefined' ? browser : chrome);
+  const store = api.storage && (api.storage.session || api.storage.local);
+  const NONE = -1;
+  const K_META = '__ffGroupMeta', K_MEMB = '__ffTabGroup', K_SEQ = '__ffGroupSeq';
+  const isBackground = (typeof document === 'undefined');
 
-// ── chrome.tabGroups (absent in Firefox) ──────────────────────────────────────
-if (!chrome.tabGroups) {
-  chrome.tabGroups = {
-    TAB_GROUP_ID_NONE: -1,
-    Color: {
-      GREY: 'grey', BLUE: 'blue', RED: 'red', YELLOW: 'yellow', GREEN: 'green',
-      PINK: 'pink', PURPLE: 'purple', CYAN: 'cyan', ORANGE: 'orange',
-    },
-    get:    async () => { throw new Error('tabGroups not supported in Firefox'); },
-    query:  async () => [],
-    update: async () => ({}),
-    move:   async () => ({}),
-    onCreated: { addListener: () => {}, removeListener: () => {}, hasListener: () => false },
-    onUpdated: { addListener: () => {}, removeListener: () => {}, hasListener: () => false },
-    onMoved:   { addListener: () => {}, removeListener: () => {}, hasListener: () => false },
-    onRemoved: { addListener: () => {}, removeListener: () => {}, hasListener: () => false },
+  const getState = async () => {
+    if (!store) return { meta: {}, memb: {}, seq: 1000 };
+    const o = await store.get([K_META, K_MEMB, K_SEQ]);
+    return { meta: o[K_META] || {}, memb: o[K_MEMB] || {}, seq: o[K_SEQ] || 1000 };
   };
-}
+  const save = async (obj) => { if (store) await store.set(obj); };
+  const toIds = (x) => (Array.isArray(x) ? x : (x != null ? [x] : [])).map(Number);
+
+  const groupFn = async (opts = {}) => {
+    const ids = toIds(opts.tabIds);
+    const st = await getState();
+    let gid = opts.groupId;
+    if (gid == null) {
+      gid = st.seq + 1; st.seq = gid;
+      let windowId;
+      try { windowId = (await api.tabs.get(ids[0])).windowId; } catch {}
+      st.meta[gid] = { id: gid, title: '', color: 'grey', collapsed: false, windowId };
+    } else if (!st.meta[gid]) {
+      st.meta[gid] = { id: gid, title: '', color: 'grey', collapsed: false };
+    }
+    for (const id of ids) st.memb[id] = gid;
+    await save({ [K_META]: st.meta, [K_MEMB]: st.memb, [K_SEQ]: st.seq });
+    return gid;
+  };
+
+  const ungroupFn = async (tabIds) => {
+    const ids = toIds(tabIds);
+    const st = await getState();
+    for (const id of ids) delete st.memb[id];
+    await save({ [K_MEMB]: st.memb });
+  };
+
+  // Promise/callback adapter matching the WebExtension dual signature.
+  const dual = (fn, onErr) => function (...args) {
+    const cb = (typeof args[args.length - 1] === 'function') ? args.pop() : null;
+    const p = fn(...args);
+    if (cb) { p.then((r) => cb(r), () => cb(onErr ? onErr() : undefined)); return; }
+    return p;
+  };
+
+  if (chrome.tabs) {
+    chrome.tabs.group   = dual(groupFn, () => NONE);
+    chrome.tabs.ungroup = dual(ungroupFn);
+
+    // Wrap query: strip the FF-unsupported groupId filter, annotate each tab's
+    // groupId from the registry, and apply groupId filtering ourselves.
+    const _q = chrome.tabs.query.bind(chrome.tabs);
+    chrome.tabs.query = function (queryInfo, callback) {
+      const qi = { ...(queryInfo || {}) };
+      const wantGroup = Object.prototype.hasOwnProperty.call(qi, 'groupId');
+      const gid = qi.groupId;
+      delete qi.groupId;
+      const run = async () => {
+        let tabs = (await _q(qi)) || [];
+        const st = await getState();
+        for (const t of tabs) {
+          if (t && typeof t.id === 'number') t.groupId = (st.memb[t.id] != null ? st.memb[t.id] : NONE);
+        }
+        if (wantGroup) tabs = tabs.filter((t) => t.groupId === gid);
+        return tabs;
+      };
+      if (typeof callback === 'function') { run().then(callback, () => callback([])); return; }
+      return run();
+    };
+
+    // Wrap get: annotate groupId on the single tab.
+    const _get = chrome.tabs.get.bind(chrome.tabs);
+    chrome.tabs.get = function (tabId, callback) {
+      const run = async () => {
+        const t = await _get(tabId);
+        const st = await getState();
+        if (t) t.groupId = (st.memb[tabId] != null ? st.memb[tabId] : NONE);
+        return t;
+      };
+      if (typeof callback === 'function') { run().then(callback, () => callback(undefined)); return; }
+      return run();
+    };
+
+    // Prune membership when a grouped tab closes (background owns this once).
+    if (isBackground && api.tabs.onRemoved) {
+      api.tabs.onRemoved.addListener(async (tabId) => {
+        try {
+          const st = await getState();
+          if (st.memb[tabId] != null) { delete st.memb[tabId]; await save({ [K_MEMB]: st.memb }); }
+        } catch {}
+      });
+    }
+  }
+
+  if (!chrome.tabGroups) {
+    chrome.tabGroups = {
+      TAB_GROUP_ID_NONE: NONE,
+      Color: {
+        GREY: 'grey', BLUE: 'blue', RED: 'red', YELLOW: 'yellow', GREEN: 'green',
+        PINK: 'pink', PURPLE: 'purple', CYAN: 'cyan', ORANGE: 'orange',
+      },
+      get: async (id) => {
+        const st = await getState();
+        if (!st.meta[id]) throw new Error(`No group with id: ${id}`);
+        return { ...st.meta[id] };
+      },
+      query: async (qi = {}) => {
+        const st = await getState();
+        return Object.values(st.meta).filter((g) =>
+          (qi.windowId == null || g.windowId === qi.windowId) &&
+          (qi.title == null || g.title === qi.title) &&
+          (qi.color == null || g.color === qi.color) &&
+          (qi.collapsed == null || g.collapsed === qi.collapsed)
+        ).map((g) => ({ ...g }));
+      },
+      update: async (id, props) => {
+        const st = await getState();
+        const m = st.meta[id] || { id, title: '', color: 'grey', collapsed: false };
+        Object.assign(m, props || {});
+        st.meta[id] = m;
+        await save({ [K_META]: st.meta });
+        return { ...m };
+      },
+      move: async (id) => {
+        const st = await getState();
+        return { ...(st.meta[id] || { id }) };
+      },
+      onCreated: { addListener: () => {}, removeListener: () => {}, hasListener: () => false },
+      onUpdated: { addListener: () => {}, removeListener: () => {}, hasListener: () => false },
+      onMoved:   { addListener: () => {}, removeListener: () => {}, hasListener: () => false },
+      onRemoved: { addListener: () => {}, removeListener: () => {}, hasListener: () => false },
+    };
+  }
+})();
 
 // ── chrome.debugger (absent in Firefox) → translate CDP to Firefox APIs ───────
 // The bundle drives page automation (click/type/screenshot/evaluate) through the
