@@ -1,0 +1,104 @@
+# План рефакторинга Claude Chrome → Firefox Extension
+
+## Контекст
+Перенос Chrome-расширения Claude на Firefox с единой кодовой базой для обоих браузеров.
+
+---
+
+## 1. manifest.json
+
+- Добавить `browser_specific_settings.gecko.id`
+- Разнести `permissions` и `host_permissions` (MV3 требует раздельно)
+- Заменить `service_worker` на `background.scripts` для Firefox MV3
+- Выбор версии манифеста: MV2 если только Firefox, MV3 если нужна совместимость с Chrome
+
+```json
+"browser_specific_settings": {
+  "gecko": {
+    "id": "claude-zen@extension"
+  }
+},
+"host_permissions": ["https://api.anthropic.com/*", "https://claude.ai/*"]
+```
+
+---
+
+## 2. API совместимость
+
+- Подключить `webextension-polyfill` от Mozilla — один файл убирает все различия `chrome.*` vs `browser.*`
+- После подключения полифила весь код писать через `browser.*`
+- Определение браузера там где нужна разная логика:
+
+```js
+const isFirefox = typeof browser !== "undefined" && browser.runtime.getBrowserInfo;
+```
+
+---
+
+## 3. Боковая панель (Side Panel)
+
+Самое крупное различие в UI:
+
+| Chrome | Firefox |
+|--------|---------|
+| `chrome.sidePanel` | `browser.sidebarAction` |
+| `chrome.sidePanel.open({ tabId })` | `browser.sidebarAction.open()` |
+
+- Написать абстракцию `openSidebar()` которая вызывает нужный API в зависимости от браузера
+- Вынести в отдельный модуль `src/utils/sidebar.js`
+
+---
+
+## 4. Background Script
+
+- Убрать всё глобальное состояние из переменных — Service Worker засыпает через 30 сек и теряет их
+- Перенести состояние в `browser.storage.session` или `browser.storage.local`
+- Проверить нет ли `eval()` или `new Function()` — в MV3 запрещены
+
+---
+
+## 5. Сетевые запросы
+
+- API-запросы к Anthropic (`fetch` к `api.anthropic.com`) — работают без изменений
+- Если есть перехват/модификация запросов через `webRequest`:
+  - Firefox MV3: оставить `webRequestBlocking` — Firefox его сохранил
+  - Chrome MV3: переписать на `declarativeNetRequest`
+
+---
+
+## 6. Запрещённые практики (CSP MV3)
+
+Проверить и убрать:
+- `eval(...)`
+- `new Function(...)`
+- `setTimeout("строка кода", ...)`
+- Динамическая загрузка скриптов через `innerHTML`
+
+---
+
+## 7. Порядок работ
+
+1. Подключить `webextension-polyfill`
+2. Исправить `manifest.json`
+3. Перенести состояние из переменных в `storage`
+4. Написать абстракцию для боковой панели
+5. Убрать запрещённые паттерны
+6. Протестировать в Firefox: `about:debugging` → "Загрузить временное дополнение"
+7. Протестировать в Chrome что ничего не сломалось
+
+---
+
+## 8. Публикация Firefox
+
+- Зарегистрироваться на addons.mozilla.org
+- Подписать расширение через AMO (бесплатно)
+- Без подписи Firefox заблокирует установку (кроме Dev Edition / Nightly)
+
+---
+
+## Оценка трудозатрат
+
+- manifest.json + полифил: ~30 мин
+- Боковая панель: ~1-2 часа
+- Background state refactor: зависит от объёма кода
+- Тестирование: ~2-3 часа

@@ -1,0 +1,6 @@
+# Captured browser session — contains claude.ai cookies/tokens, never commit
+*.har
+
+# OS / editor junk
+.DS_Store
+Thumbs.db

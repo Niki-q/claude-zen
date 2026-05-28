@@ -1,0 +1,78 @@
+{
+   "action": {
+      "default_title": "Open Claude"
+   },
+   "background": {
+      "scripts": ["firefox-page-shims.js", "firefox-bg-loader.js"]
+   },
+   "browser_specific_settings": {
+      "gecko": {
+         "id": "claude-zen@firefox",
+         "strict_min_version": "128.0"
+      }
+   },
+   "commands": {
+      "toggle-side-panel": {
+         "description": "Toggle Claude side panel",
+         "suggested_key": {
+            "default": "Ctrl+E",
+            "mac": "Command+E"
+         }
+      }
+   },
+   "content_scripts": [ {
+      "js": [ "firefox-oauth-bridge.js" ],
+      "matches": [ "https://claude.ai/*", "https://*.claude.ai/*" ],
+      "run_at": "document_start",
+      "world": "MAIN"
+   }, {
+      "js": [ "firefox-oauth-relay.js" ],
+      "matches": [ "https://claude.ai/*", "https://*.claude.ai/*" ],
+      "run_at": "document_start"
+   }, {
+      "js": [ "assets/content-script.ts-loader-DKJzsl7H.js" ],
+      "matches": [ "https://claude.ai/*", "https://*.claude.ai/*" ],
+      "run_at": "document_end"
+   }, {
+      "all_frames": true,
+      "js": [ "assets/accessibility-tree.js-CCweLwU2.js" ],
+      "matches": [ "<all_urls>" ],
+      "run_at": "document_start"
+   }, {
+      "all_frames": false,
+      "js": [ "assets/agent-visual-indicator.js-4Dz8W1_X.js" ],
+      "matches": [ "<all_urls>" ],
+      "run_at": "document_idle"
+   } ],
+   "content_security_policy": {
+      "extension_pages": "script-src 'self'; object-src 'self'; connect-src 'self' https://api.anthropic.com wss://api.anthropic.com https://claude.ai https://platform.claude.com https://api.segment.io https://*.segment.com https://*.ingest.us.sentry.io https://api.honeycomb.io https://browser-intake-us5-datadoghq.com wss://bridge.claudeusercontent.com wss://bridge-staging.claudeusercontent.com; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; font-src 'self' data:;"
+   },
+   "description": "Claude in Firefox (Beta)",
+   "host_permissions": [ "<all_urls>" ],
+   "icons": {
+      "128": "icon-128.png"
+   },
+   "manifest_version": 3,
+   "name": "Claude",
+   "options_page": "options.html",
+   "permissions": [
+      "storage", "activeTab", "scripting",
+      "tabs", "alarms", "notifications", "webNavigation",
+      "declarativeNetRequest", "nativeMessaging",
+      "unlimitedStorage", "downloads", "identity",
+      "webRequest", "webRequestBlocking"
+   ],
+   "sidebar_action": {
+      "default_panel": "sidepanel.html",
+      "default_title": "Claude",
+      "default_icon": "icon-128.png"
+   },
+   "version": "1.0.72",
+   "web_accessible_resources": [ {
+      "matches": [ "https://*.claude.ai/*", "https://claude.ai/*" ],
+      "resources": [ "assets/onboarding-prompts-CWLEgoC0.js", "assets/content-script.ts-zjy42LA0.js" ]
+   }, {
+      "matches": [ "<all_urls>" ],
+      "resources": [ "assets/accessibility-tree.js-CCweLwU2.js", "assets/agent-visual-indicator.js-4Dz8W1_X.js", "oauth_callback.html", "oauth_callback.js" ]
+   } ]
+}

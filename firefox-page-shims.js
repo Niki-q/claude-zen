@@ -1,0 +1,497 @@
+// Firefox shim layer (classic script).
+// Loaded in every context that runs the minified Chrome assets:
+//   - background  (first entry in background.scripts)
+//   - sidepanel.html / options.html / pairing.html  (injected <script> before the module)
+// Must run BEFORE the minified bundles, which touch Chrome-only APIs at
+// module-evaluation time (chrome.tabGroups, chrome.debugger, etc).
+
+// ── Block CDN script injection blocked by extension CSP (runs in page contexts) ─
+if (typeof document !== 'undefined') {
+  (function () {
+    const blocked        = /^https?:\/\/cdn\.segment\.com\//;
+    const _appendChild   = Element.prototype.appendChild;
+    const _insertBefore  = Element.prototype.insertBefore;
+    const isCdnScript    = (node) =>
+      node && node.nodeName === 'SCRIPT' &&
+      blocked.test(node.getAttribute ? (node.getAttribute('src') || '') : (node.src || ''));
+    Element.prototype.appendChild = function (node) {
+      if (isCdnScript(node)) return node;
+      return _appendChild.call(this, node);
+    };
+    Element.prototype.insertBefore = function (node, ref) {
+      if (isCdnScript(node)) return node;
+      return _insertBefore.call(this, node, ref);
+    };
+  })();
+}
+
+// ── Suppress known Datadog double-bundle warnings (SDK split across chunks) ───
+(function () {
+  const _warn = console.warn.bind(console);
+  console.warn = (...args) => {
+    const msg = typeof args[0] === 'string' ? args[0] : '';
+    if (msg.startsWith('Datadog Browser SDK:')) return;
+    _warn(...args);
+  };
+})();
+
+// ── Inject anthropic-client-* headers into api.anthropic.com fetches ──────────
+// The Chrome bundle adds these via declarativeNetRequest; Firefox's DNR
+// modifyHeaders is unreliable (modifyHeaders support / resourceType matching),
+// so requests to api.anthropic.com arrive WITHOUT the client headers the API
+// uses to validate the OAuth client → HTTP 401 on /v1/messages.
+//
+// We add them at the fetch layer here. Verified safe: api.anthropic.com's CORS
+// reflects requested headers (access-control-allow-headers echoes them, origin *),
+// so the preflight accepts anthropic-client-platform/version. User-Agent is a
+// forbidden fetch header and is instead set via webRequest in firefox-bg-loader.js.
+// Also logs 401/403 response bodies to surface any remaining auth failure cause.
+if (typeof window !== 'undefined' && typeof window.fetch === 'function') {
+  const _origFetch = window.fetch;
+  const _ver = (() => { try { return chrome.runtime.getManifest().version; } catch { return ''; } })();
+  window.fetch = async function (input, init) {
+    const url = typeof input === 'string' ? input
+      : (input instanceof URL ? input.href : (input && input.url) || '');
+    try {
+      if (url.startsWith('https://api.anthropic.com/')) {
+        if (input && typeof input === 'object' && !(input instanceof URL) &&
+            input.headers && typeof input.headers.set === 'function') {
+          // Request object — mutate its headers in place
+          if (!input.headers.has('anthropic-client-platform')) input.headers.set('anthropic-client-platform', 'claude_browser_extension');
+          if (_ver && !input.headers.has('anthropic-client-version')) input.headers.set('anthropic-client-version', _ver);
+        } else {
+          // string / URL input — merge into init.headers
+          const h = new Headers((init && init.headers) || undefined);
+          if (!h.has('anthropic-client-platform')) h.set('anthropic-client-platform', 'claude_browser_extension');
+          if (_ver && !h.has('anthropic-client-version')) h.set('anthropic-client-version', _ver);
+          init = { ...(init || {}), headers: h };
+        }
+      }
+    } catch (e) { console.warn('[claude-zen] fetch header inject failed:', e?.message); }
+
+    const resp = await _origFetch.call(this, input, init);
+    try {
+      if (url.includes('api.anthropic.com') && (resp.status === 401 || resp.status === 403)) {
+        const body = await resp.clone().text();
+        console.error(`[claude-zen] ${resp.status} from ${url}\n  body: ${body.slice(0, 600)}`);
+      }
+    } catch {}
+    return resp;
+  };
+}
+
+// ── chrome.tabs.query: Firefox sidebar workaround ─────────────────────────────
+// In Firefox sidebar context, tabs.query({active:true,currentWindow:true})
+// returns [] — the sidebar's window is treated as having no tabs of its own.
+// The Chrome bundle relies on this query to find the user's active tab and
+// throws "No active tab" otherwise (sidepanel handleKeyDown → Me).
+// Strategy: if the native query returns empty, fall back to querying without
+// the window filter and pick the active tab in the most-recently-focused
+// normal browser window.
+if (chrome.tabs && chrome.tabs.query) {
+  const _origTabsQuery = chrome.tabs.query.bind(chrome.tabs);
+  chrome.tabs.query = function (queryInfo, callback) {
+    const wantsActive = queryInfo && queryInfo.active === true;
+    const hasWindowFilter = queryInfo &&
+      (queryInfo.currentWindow === true || queryInfo.lastFocusedWindow === true);
+
+    if (!(wantsActive && hasWindowFilter)) {
+      if (typeof callback === 'function') return _origTabsQuery(queryInfo, callback);
+      return _origTabsQuery(queryInfo);
+    }
+
+    const handle = async () => {
+      // 1. Native first — may work in background or in a normal extension page
+      let tabs;
+      try { tabs = await _origTabsQuery(queryInfo); } catch { tabs = []; }
+      if (tabs && tabs.length > 0) return tabs;
+
+      // 2. Drop window filter, ask for active tabs anywhere
+      const noWin = { ...queryInfo };
+      delete noWin.currentWindow;
+      delete noWin.lastFocusedWindow;
+      let allActive;
+      try { allActive = await _origTabsQuery(noWin); } catch { allActive = []; }
+      if (!allActive || allActive.length === 0) return [];
+
+      // 3. Prefer the tab in the most-recently-focused normal browser window
+      try {
+        if (chrome.windows && chrome.windows.getLastFocused) {
+          const w = await new Promise((resolve) => {
+            try {
+              const r = chrome.windows.getLastFocused(
+                { windowTypes: ['normal'] },
+                (win) => resolve(win)
+              );
+              if (r && typeof r.then === 'function') r.then(resolve, () => resolve(null));
+            } catch { resolve(null); }
+          });
+          if (w && typeof w.id === 'number') {
+            const matched = allActive.filter((t) => t.windowId === w.id);
+            if (matched.length > 0) return matched;
+          }
+        }
+      } catch {}
+
+      // 4. Last resort: drop tabs in extension/internal pages
+      const normal = allActive.filter((t) =>
+        t.url &&
+        !t.url.startsWith('moz-extension://') &&
+        !t.url.startsWith('about:') &&
+        !t.url.startsWith('chrome://')
+      );
+      return normal.length > 0 ? normal : allActive;
+    };
+
+    if (typeof callback === 'function') {
+      handle().then(callback, () => { try { callback([]); } catch {} });
+      return;
+    }
+    return handle();
+  };
+}
+
+// ── Firefox: inject ?tabId=N into sidepanel URL before bundle loads ──────────
+// Chrome's bundle reads tabId from `sidepanel.html?tabId=N` (URL param set by
+// chrome.sidePanel.setOptions at click time). Firefox's sidebar has a single
+// persistent URL — there is no per-tab routing — so the bundle reads undefined,
+// the active-tab state `c` stays empty, and any user action throws "No active tab".
+//
+// The bundle's <script> tag in sidepanel.html is given type="firefox-deferred-module"
+// (an unknown type the browser ignores). We resolve the active tab, write
+// ?tabId=N via history.replaceState (no navigation), then create a real
+// <script type="module"> with the same src so the bundle finally runs with
+// the parameter present.
+//
+// Must run AFTER the chrome.tabs.query patch (above) because the Promise
+// constructor calls chrome.tabs.query synchronously.
+if (typeof document !== 'undefined' &&
+    typeof window !== 'undefined' &&
+    document.location.pathname.endsWith('/sidepanel.html')) {
+  (function () {
+    const LOG = '[claude-zen sidepanel]';
+    let released = false;
+    let asyncDone = false;
+    let domDone = (document.readyState !== 'loading');
+
+    // Secondary safety net: once we know the active tab, expose it so that
+    // URLSearchParams("...").get("tabId") returns it even if replaceState
+    // somehow didn't stick. The deferred-module loading guarantees this cache
+    // is populated before any bundle code reads the URL.
+    const _origGet = URLSearchParams.prototype.get;
+    URLSearchParams.prototype.get = function (key) {
+      const v = _origGet.call(this, key);
+      if ((v === null || v === undefined) && key === 'tabId' && window.__ffActiveTabId != null) {
+        return String(window.__ffActiveTabId);
+      }
+      return v;
+    };
+
+    const tryRelease = () => {
+      if (released || !asyncDone || !domDone) return;
+      released = true;
+      const deferred = document.querySelectorAll('script[type="firefox-deferred-module"]');
+      console.log(`${LOG} releasing ${deferred.length} deferred module script(s); tabId=${window.__ffActiveTabId}`);
+      deferred.forEach((node) => {
+        const src = node.src;
+        const co = node.getAttribute('crossorigin');
+        const s = document.createElement('script');
+        s.type = 'module';
+        if (co !== null) s.setAttribute('crossorigin', co);
+        s.src = src;
+        node.parentNode.insertBefore(s, node);
+        node.remove();
+      });
+    };
+
+    if (!domDone) {
+      document.addEventListener('DOMContentLoaded', () => {
+        domDone = true;
+        tryRelease();
+      }, { once: true });
+    }
+
+    (async () => {
+      try {
+        const sp = new URLSearchParams(window.location.search);
+        // Skip injection for mode=window — the bundle resolves tabId from
+        // storage.TARGET_TAB_ID in that case (used for scheduled-task popups).
+        if (!sp.has('tabId') && sp.get('mode') !== 'window') {
+          const tabs = await new Promise((resolve) => {
+            try {
+              const r = chrome.tabs.query(
+                { active: true, lastFocusedWindow: true },
+                (t) => resolve(t || [])
+              );
+              if (r && typeof r.then === 'function') r.then(resolve, () => resolve([]));
+            } catch { resolve([]); }
+          });
+          console.log(`${LOG} tabs.query returned ${(tabs || []).length} tab(s)`, (tabs || []).map((t) => ({ id: t.id, url: (t.url || '').slice(0, 50) })));
+          const normal = (tabs || []).filter((t) =>
+            t.url &&
+            !t.url.startsWith('moz-extension://') &&
+            !t.url.startsWith('about:') &&
+            !t.url.startsWith('chrome://')
+          );
+          const pick = normal[0] || (tabs || [])[0];
+          if (pick && pick.id != null) {
+            window.__ffActiveTabId = pick.id;
+            const url = new URL(window.location.href);
+            url.searchParams.set('tabId', String(pick.id));
+            try { history.replaceState({}, '', url); } catch (e) { console.warn(`${LOG} replaceState failed`, e); }
+            console.log(`${LOG} active tabId resolved: ${pick.id}`);
+          } else {
+            console.warn(`${LOG} could not resolve an active tab — bundle may show "No active tab"`);
+          }
+        }
+      } catch (e) {
+        console.warn(`${LOG} tabId injection error`, e);
+      }
+      asyncDone = true;
+      tryRelease();
+    })();
+
+    // Safety net — release after 2 s even if the tab fetch hangs
+    setTimeout(() => {
+      asyncDone = true;
+      tryRelease();
+    }, 2000);
+  })();
+}
+
+// ── chrome.tabs.group / ungroup (absent in Firefox 128) ───────────────────────
+// Tab grouping is Chrome-only. The bundle's orchestration calls these; most
+// call sites are try/catch-wrapped, but an undefined function would still throw
+// a TypeError. Provide stubs so grouping degrades to a no-op instead of crashing
+// the surrounding operation.
+if (chrome.tabs) {
+  if (typeof chrome.tabs.group !== 'function') {
+    chrome.tabs.group = async () => { throw new Error('tabs.group not supported in Firefox'); };
+  }
+  if (typeof chrome.tabs.ungroup !== 'function') {
+    chrome.tabs.ungroup = async () => {};
+  }
+}
+
+// ── chrome.tabGroups (absent in Firefox) ──────────────────────────────────────
+if (!chrome.tabGroups) {
+  chrome.tabGroups = {
+    TAB_GROUP_ID_NONE: -1,
+    Color: {
+      GREY: 'grey', BLUE: 'blue', RED: 'red', YELLOW: 'yellow', GREEN: 'green',
+      PINK: 'pink', PURPLE: 'purple', CYAN: 'cyan', ORANGE: 'orange',
+    },
+    get:    async () => { throw new Error('tabGroups not supported in Firefox'); },
+    query:  async () => [],
+    update: async () => ({}),
+    move:   async () => ({}),
+    onCreated: { addListener: () => {}, removeListener: () => {}, hasListener: () => false },
+    onUpdated: { addListener: () => {}, removeListener: () => {}, hasListener: () => false },
+    onMoved:   { addListener: () => {}, removeListener: () => {}, hasListener: () => false },
+    onRemoved: { addListener: () => {}, removeListener: () => {}, hasListener: () => false },
+  };
+}
+
+// ── chrome.debugger (absent in Firefox) ───────────────────────────────────────
+// Page-automation features rely on this and will not work, but stubbing lets the
+// bundle load. registerDebuggerEventHandlers() reads chrome.debugger.onEvent on init.
+if (!chrome.debugger) {
+  chrome.debugger = {
+    attach:      async () => { throw new Error('chrome.debugger not supported in Firefox'); },
+    detach:      async () => {},
+    sendCommand: async () => { throw new Error('chrome.debugger not supported in Firefox'); },
+    getTargets:  async () => [],
+    onEvent:  { addListener: () => {}, removeListener: () => {}, hasListener: () => false },
+    onDetach: { addListener: () => {}, removeListener: () => {}, hasListener: () => false },
+  };
+}
+
+// ── chrome.sidePanel → browser.sidebarAction ──────────────────────────────────
+// The bundle calls setOptions({tabId, path:`sidepanel.html?tabId=${id}`}) before
+// open() to bind a per-tab sidebar URL. Firefox's sidebarAction.setPanel supports
+// a per-tab panel via the tabId option, so we translate it directly. This makes
+// the sidebar open with ?tabId=N already in the URL — the bundle then reads it
+// and the active-tab state is populated (otherwise it throws "No active tab").
+// The deferred-module loader in this file is a backup for paths that bypass
+// setOptions (e.g. Firefox's own sidebar toolbar button).
+if (!chrome.sidePanel) {
+  chrome.sidePanel = {
+    setOptions: async (opts) => {
+      try {
+        if (opts && opts.path && browser.sidebarAction && browser.sidebarAction.setPanel) {
+          const details = { panel: opts.path };
+          if (opts.tabId != null) details.tabId = opts.tabId;
+          await browser.sidebarAction.setPanel(details);
+        }
+      } catch {}
+    },
+    open:             async () => { try { await browser.sidebarAction.open();  } catch {} },
+    close:            async () => { try { await browser.sidebarAction.close(); } catch {} },
+    getOptions:       async () => ({ enabled: true, path: 'sidepanel.html' }),
+    setPanelBehavior: async () => {},
+  };
+}
+
+// ── chrome.offscreen → no-op stubs ────────────────────────────────────────────
+if (!chrome.offscreen) {
+  chrome.offscreen = {
+    hasDocument:    async () => false,
+    createDocument: async () => {},
+    closeDocument:  async () => {},
+    Reason: {
+      AUDIO_PLAYBACK: 'AUDIO_PLAYBACK', BLOBS: 'BLOBS',
+      CLIPBOARD: 'CLIPBOARD',           DISPLAY_MEDIA: 'DISPLAY_MEDIA',
+      DOM_PARSER: 'DOM_PARSER',         DOM_SCRAPING: 'DOM_SCRAPING',
+      IFRAME_SCRIPTING: 'IFRAME_SCRIPTING', LOCAL_STORAGE: 'LOCAL_STORAGE',
+      MATCH_MEDIA: 'MATCH_MEDIA',       TESTING: 'TESTING',
+      USER_MEDIA: 'USER_MEDIA',         WORKERS: 'WORKERS',
+    },
+  };
+}
+
+// ── chrome.declarativeNetRequest enums (undefined in Firefox) ─────────────────
+// Firefox does not expose the RuleActionType / HeaderOperation / ResourceType
+// enum objects. The bundle's B() builds a MODIFY_HEADERS session rule via
+// `chrome.declarativeNetRequest.RuleActionType.MODIFY_HEADERS` etc.; in Firefox
+// those enum objects are undefined, so the property access throws a TypeError.
+// B() is `await`ed at the TOP of both the onStartup and onInstalled handlers
+// (before t.initialize(), bridge setup, native messaging…), so the throw ABORTS
+// the entire background-init sequence on every startup. We supply the enum
+// string constants so the rule object builds cleanly. The client headers
+// themselves are injected via fetch (page) + webRequest (background); the
+// MODIFY_HEADERS rule itself is allowed to run (FF 128 may honor it) but
+// updateSessionRules is wrapped so a rejection can never abort init.
+try {
+  if (chrome.declarativeNetRequest) {
+    let dnr = chrome.declarativeNetRequest;
+    const RAT = {
+      BLOCK: 'block', REDIRECT: 'redirect', ALLOW: 'allow',
+      UPGRADE_SCHEME: 'upgradeScheme', MODIFY_HEADERS: 'modifyHeaders',
+      ALLOW_ALL_REQUESTS: 'allowAllRequests',
+    };
+    const HO = { APPEND: 'append', SET: 'set', REMOVE: 'remove' };
+    const RT = {
+      MAIN_FRAME: 'main_frame', SUB_FRAME: 'sub_frame', STYLESHEET: 'stylesheet',
+      SCRIPT: 'script', IMAGE: 'image', FONT: 'font', OBJECT: 'object',
+      XMLHTTPREQUEST: 'xmlhttprequest', PING: 'ping', CSP_REPORT: 'csp_report',
+      MEDIA: 'media', WEBSOCKET: 'websocket', OTHER: 'other',
+    };
+    // Try plain assignment, then defineProperty (handles a sealed sub-object).
+    const ensure = (obj, key, val) => {
+      if (obj[key]) return;
+      try { obj[key] = val; } catch {}
+      if (!obj[key]) { try { Object.defineProperty(obj, key, { value: val, configurable: true, writable: true }); } catch {} }
+    };
+    ensure(dnr, 'RuleActionType', RAT);
+    ensure(dnr, 'HeaderOperation', HO);
+    ensure(dnr, 'ResourceType', RT);
+
+    // If the namespace was non-extensible, replace it wholesale (delegating methods)
+    // so the bundle's `chrome.declarativeNetRequest.RuleActionType.MODIFY_HEADERS`
+    // never throws and aborts the onStartup/onInstalled init sequence.
+    if (!dnr.RuleActionType || !dnr.HeaderOperation || !dnr.ResourceType) {
+      const orig = dnr;
+      const wrapMethod = (name, fallback) => (...a) => {
+        try { return orig[name] ? orig[name](...a) : fallback(); }
+        catch (e) { console.warn(`[claude-zen] DNR ${name} ignored (FF):`, e?.message); return fallback(); }
+      };
+      const replacement = {
+        RuleActionType: RAT, HeaderOperation: HO, ResourceType: RT,
+        updateSessionRules: wrapMethod('updateSessionRules', () => Promise.resolve()),
+        getSessionRules: wrapMethod('getSessionRules', () => Promise.resolve([])),
+        updateDynamicRules: wrapMethod('updateDynamicRules', () => Promise.resolve()),
+        getDynamicRules: wrapMethod('getDynamicRules', () => Promise.resolve([])),
+      };
+      try { chrome.declarativeNetRequest = replacement; } catch {}
+      dnr = chrome.declarativeNetRequest;
+    } else if (typeof dnr.updateSessionRules === 'function') {
+      // Enums set in place — wrap updateSessionRules so a rejected modifyHeaders
+      // rule (FF may not honor it) can never abort the init sequence.
+      const _origUSR = dnr.updateSessionRules.bind(dnr);
+      const wrapped = async (...a) => {
+        try { return await _origUSR(...a); }
+        catch (e) { console.warn('[claude-zen] DNR updateSessionRules ignored (FF):', e?.message); }
+      };
+      try { dnr.updateSessionRules = wrapped; } catch {
+        try { Object.defineProperty(dnr, 'updateSessionRules', { value: wrapped, configurable: true, writable: true }); } catch {}
+      }
+    }
+  }
+} catch (e) { console.warn('[claude-zen] declarativeNetRequest shim error:', e?.message); }
+
+// ── chrome.identity shim ─────────────────────────────────────────────────────
+// Firefox lacks chrome.identity. Implementation:
+//   - Background context → calls browser.identity.launchWebAuthFlow directly
+//   - Page context (sidepanel) → routes through background via FF_IDENTITY_LAUNCH
+// Both paths use CHROME_URI as redirect_url — this is the only URI registered
+// with Anthropic. chromiumapp.org is NOT registered (causes "Invalid request format").
+if (!chrome.identity) {
+  const CHROME_URI   = 'chrome-extension://fcoeoabgfenejglbffodgkkbkcdhcgfn/oauth_callback.html';
+  const FF_REDIRECT  = 'https://fcoeoabgfenejglbffodgkkbkcdhcgfn.chromiumapp.org/';
+  const isBackground = typeof document === 'undefined';
+
+  const _doLaunch = async (url, interactive, timeoutMs) => {
+    if (isBackground) {
+      // Try browser.identity first (native Firefox OAuth popup)
+      if (typeof browser !== 'undefined' && browser.identity) {
+        try {
+          return await browser.identity.launchWebAuthFlow({
+            url, interactive, redirect_url: CHROME_URI,
+          });
+        } catch (e) {
+          console.warn('[claude-zen] browser.identity failed, trying manualTabAuth:', e.message);
+        }
+      }
+      // Fallback: manualTabAuth with webRequest interception (exposed by firefox-bg-loader.js)
+      if (typeof self._claudeZenManualAuth === 'function') {
+        return self._claudeZenManualAuth(url, interactive, timeoutMs);
+      }
+      throw new Error('No background auth mechanism available');
+    }
+    const res = await chrome.runtime.sendMessage({
+      type: 'FF_IDENTITY_LAUNCH', url, interactive, timeoutMs,
+    });
+    if (!res || res.error) throw new Error(res?.error || 'Auth cancelled');
+    return res.url;
+  };
+
+  chrome.identity = {
+    getRedirectURL: (path) => FF_REDIRECT + (path || ''),
+
+    launchWebAuthFlow: (details, callback) => {
+      const interactive = details.interactive !== false;
+      const timeoutMs   = interactive
+        ? 120_000
+        : (details.timeoutMsForNonInteractive || 5000);
+
+      const p = _doLaunch(details.url, interactive, timeoutMs)
+        .then((url) => {
+          delete chrome.runtime.lastError;
+          if (callback) callback(url);
+          return url;
+        })
+        .catch((err) => {
+          const msg = err?.message || String(err);
+          chrome.runtime.lastError = { message: msg };
+          if (callback) callback(undefined);
+          throw err;
+        });
+      return p;
+    },
+
+    getAuthToken:              (_, cb) => { if (cb) cb(undefined); return Promise.resolve(undefined); },
+    removeCachedAuthToken:     (_, cb) => { if (cb) cb();          return Promise.resolve(); },
+    clearAllCachedAuthTokens:  (cb)    => { if (cb) cb();          return Promise.resolve(); },
+  };
+}
+
+// ── Theme detection (replaces the CSP-blocked inline <script> in HTML pages) ──
+try {
+  if (typeof document !== 'undefined' && typeof window !== 'undefined' && window.matchMedia) {
+    const mq = window.matchMedia('(prefers-color-scheme: dark)');
+    const apply = (dark) =>
+      document.documentElement.setAttribute('data-mode', dark ? 'dark' : 'light');
+    apply(mq.matches);
+    mq.addEventListener('change', (e) => apply(e.matches));
+  }
+} catch {}
