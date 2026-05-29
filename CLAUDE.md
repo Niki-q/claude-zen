@@ -53,7 +53,12 @@ Hand-written classic (non-module) scripts that are loaded **before** the bundle 
 
 - **`chrome.sidePanel` → `browser.sidebarAction`**: Firefox sidebar is shared globally; the shim accepts `setOptions({path: "sidepanel.html?tabId=N"})` and applies it globally via `browser.sidebarAction.setPanel()`. The global URL is fixed; the per-tab `tabId` is injected into the URL params by the deferred-module loader (see below) instead.
   
-- **`chrome.tabGroups`** (tab grouping): **HYBRID** design (feature-detected via `nativeGroups` = `chrome.tabGroups` exists with a numeric `TAB_GROUP_ID_NONE`). The crux: Firefox 139's *native* `chrome.tabs.group` **refuses to group privileged/extension pages** (`moz-extension://`, `about:*`, `chrome://`) — and Claude's "main tab" is frequently exactly that (a new-tab-page override), while freshly created scratch tabs open at `about:newtab`. Using native blindly meant `createGroup(mainTab)` threw, no group was ever created, and the agent couldn't control any new tab ("No group found for main tab", "not in the same group"). So the shim keeps a `storage.session` **registry as the unified membership source of truth**:
+- **`chrome.tabGroups`** (tab grouping): **HYBRID** design. **Two distinct feature gates** (this matters — Firefox shipped them in different versions):
+  - `canGroup` = `chrome.tabs.group` is a function → **FF 138+**. Gates the creation of *visible native groups* (`isGroupable`, the native branch of `groupFn`, and the visual-promotion listener). This is what makes a real Firefox group appear.
+  - `nativeGroups` = the `chrome.tabGroups` *namespace* exists (numeric `TAB_GROUP_ID_NONE`) → **FF 139+**. Gates only the title/color overlay (`tabGroups.get/query/update/move`).
+  - **Bug history:** originally *everything* native was gated on `nativeGroups`, so FF 138 users (who have `tabs.group()` but not the namespace) got **no visible group at all** — the promotion listener was never installed. Splitting the gates fixed it; FF 138 now gets a visible (untitled) group, FF 139+ gets the orange "Claude" title too. A `[claude-zen][groups] init ff=… tabs.group=… tabGroups.ns=…` line is logged at background startup to confirm which path is active.
+
+  The crux: Firefox 139's *native* `chrome.tabs.group` **refuses to group privileged/extension pages** (`moz-extension://`, `about:*`, `chrome://`) — and Claude's "main tab" is frequently exactly that (a new-tab-page override), while freshly created scratch tabs open at `about:newtab`. Using native blindly meant `createGroup(mainTab)` threw, no group was ever created, and the agent couldn't control any new tab ("No group found for main tab", "not in the same group"). So the shim keeps a `storage.session` **registry as the unified membership source of truth**:
   - **Groupable web tab** → creates a **real, visible native group**, mirrored into the registry (`native: true`).
   - **Privileged tab / native rejection / FF ≤138** → emulates a logical group with a **negative id** (never collides with native positive ids or `NONE = -1`), `native: false`.
   - `chrome.tabs.get`/`query` are **overlaid** so a tab's `groupId` comes from the registry when Claude manages it, else from the native value — real groups, emulated groups, and user-made native groups all report consistently. `chrome.tabGroups.get/query/update/move` are likewise overlaid (registry first, forwarding to native for `native:true` groups).
@@ -295,6 +300,10 @@ The debugger CDP shim's `scripting.executeScript()` creates synthetic `MouseEven
 
 Example: contentEditable fields may not respond to synthetic keystrokes. The shim works around this by calling `document.execCommand('insertText')` or direct value setter for text inputs.
 
+### Background Context Detection (Firefox background is a DOM page!)
+
+Because Firefox MV3's background is a **real DOM page** (not a service worker), `document` and `window` both exist there — so the naive `isBackground = (typeof document === 'undefined')` test (correct for Chrome's SW) is **always false on Firefox**. Any background-only listener gated on that test silently never installs. This bit the tab-groups visual-promotion listener for several iterations. The tab-groups IIFE now detects the FF background via `location.pathname` ending in `_generated_background_page.html` (with a `chrome.extension.getBackgroundPage() === window` fallback), keeping the `typeof document === 'undefined'` branch for Chrome's SW. **When adding any new background-only logic, reuse this detection — do not reintroduce the `typeof document` test.** (Note: a second, latent copy of the bad test still exists in the OAuth block but is dead code, since OAuth is driven from the sidepanel.)
+
 ### Service Worker Sleep (Background Throttling)
 
 Firefox MV3 background scripts are real pages (not service workers) and don't sleep, but the original code may have assumed Chrome's 30-second idle kill. State is kept in `storage.session` (shared across background + sidepanel, survives SW unload, cleared on browser restart) rather than global variables.
@@ -354,6 +363,6 @@ If the manifest and shims are still compatible with Chrome MV3:
 
 ## Future Enhancements
 
-- **Visual tab groups**: ✅ Done — native `chrome.tabGroups` is used on Firefox 139+ (the registry emulation remains only as a ≤138 fallback). Once a 139+ floor is acceptable, `strict_min_version` can be bumped to `139.0` and the emulation branch deleted.
+- **Visual tab groups**: ✅ Done — real native groups appear on **FF 138+** (gated on `canGroup`/`tabs.group`), with the orange "Claude" title/color added on **FF 139+** (gated on `nativeGroups`/the `tabGroups` namespace). The registry emulation remains only as a true fallback for privileged-only sessions or FF ≤137.
 - **Cleaner CDP emulation**: If Firefox adds a debugger API, remove the synthetic event layer
 - **DNR reliability**: Monitor Firefox's `modifyHeaders` support as it matures; if it becomes reliable, remove the webRequest fallback

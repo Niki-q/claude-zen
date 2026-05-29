@@ -498,7 +498,23 @@ if (typeof document !== 'undefined' &&
   const store = api.storage && (api.storage.session || api.storage.local);
   const NONE = -1;
   const K_META = '__ffGroupMeta', K_MEMB = '__ffTabGroup', K_SEQ = '__ffGroupSeq';
-  const isBackground = (typeof document === 'undefined');
+  // Detect the background context. On Chrome MV3 the background is a service worker
+  // (no `document`). On FIREFOX MV3 the background is a real DOM page (document EXISTS),
+  // so the old `typeof document === 'undefined'` test was always false there — meaning
+  // the background-only listeners (visual promotion, onRemoved pruning) NEVER installed.
+  // Identify Firefox's background by its generated page URL / getBackgroundPage identity.
+  const isBackground = (() => {
+    if (typeof document === 'undefined') return true;            // Chrome MV3 service worker
+    try {
+      if (typeof location !== 'undefined' &&
+          /_generated_background_page\.html$/.test(location.pathname || '')) return true;
+    } catch {}
+    try {
+      if (chrome.extension && typeof chrome.extension.getBackgroundPage === 'function' &&
+          chrome.extension.getBackgroundPage() === window) return true;
+    } catch {}
+    return false;
+  })();
 
   // FF 139+ exposes chrome.tabGroups + chrome.tabs.group natively.
   const nativeGroups = (typeof chrome.tabGroups !== 'undefined' &&
@@ -513,10 +529,24 @@ if (typeof document !== 'undefined' &&
   const _natTgGet    = (chrome.tabGroups && chrome.tabGroups.get)    ? chrome.tabGroups.get.bind(chrome.tabGroups)    : null;
   const _natTgUpdate = (chrome.tabGroups && chrome.tabGroups.update) ? chrome.tabGroups.update.bind(chrome.tabGroups) : null;
 
+  // CRITICAL: tabs.group() shipped in Firefox 138; the tabGroups *namespace*
+  // (TAB_GROUP_ID_NONE, tabGroups.update for title/color) only in Firefox 139.
+  // Gate the creation of VISIBLE native groups on the method (canGroup), NOT on the
+  // namespace (nativeGroups) — otherwise FF 138 users get no visible group at all.
+  // nativeGroups stays the gate only for the title/color overlay (FF 139+).
+  const canGroup = typeof _natGroup === 'function';
+  if (isBackground) {
+    try {
+      console.log('[claude-zen][groups] init',
+        'ff=' + (((typeof navigator !== 'undefined' && navigator.userAgent) || '').match(/Firefox\/[\d.]+/) || ['?'])[0],
+        'tabs.group=' + canGroup, 'tabGroups.ns=' + nativeGroups, 'tabGroups.update=' + !!_natTgUpdate);
+    } catch {}
+  }
+
   // Tabs showing these schemes cannot be placed in a native Firefox tab group.
   const PRIVILEGED = /^(moz-extension|chrome-extension|about|chrome|view-source|data|resource|file):/i;
   const isGroupable = async (id) => {
-    if (!nativeGroups || !_natGet) return false;
+    if (!canGroup || !_natGet) return false;
     try { const t = await _natGet(id); const u = t && t.url; return !!u && !PRIVILEGED.test(u); }
     catch { return false; }
   };
@@ -565,8 +595,27 @@ if (typeof document !== 'undefined' &&
       return gid;
     }
 
+    // Dedup: the bundle's createGroup(mainTab) calls group() with NO groupId whenever it
+    // can't find the group in its own (empty) metadata Map — so it tries to make a SECOND
+    // native group for a session we already track, racing our promotion and splitting the
+    // initial tab away from the new ones. If any incoming tab is already in a registry
+    // group, route all of them into THAT group instead of creating a new one.
+    if (gid == null) {
+      const existing = ids.map((id) => st.memb[id]).find((g) => g != null && st.meta[g]);
+      if (existing != null) {
+        if (st.meta[existing].native && _natGroup) {
+          const ok = [];
+          for (const id of ids) if (await isGroupable(id)) ok.push(id);
+          if (ok.length) { try { await _natGroup({ tabIds: ok, groupId: existing }); } catch {} }
+        }
+        for (const id of ids) st.memb[id] = existing;
+        await save({ [K_MEMB]: st.memb });
+        return existing;
+      }
+    }
+
     // New group from groupable tabs → real native group, mirrored into the registry.
-    if (gid == null && nativeGroups && _natGroup) {
+    if (gid == null && canGroup && _natGroup) {
       let allOk = ids.length > 0;
       for (const id of ids) if (!(await isGroupable(id))) { allOk = false; break; }
       if (allOk) {
@@ -754,34 +803,55 @@ if (typeof document !== 'undefined' &&
   // at creation (about:newtab) and can't be natively grouped until they navigate to a
   // real URL — so we promote them on navigation. Promotions are serialized so several
   // tabs navigating at once (e.g. browser_batch) land in ONE native group, not many.
-  if (isBackground && nativeGroups && _natGroup && api.tabs && api.tabs.onUpdated) {
+  if (isBackground && canGroup && _natGroup && api.tabs && api.tabs.onUpdated) {
     const VISUAL_TITLE = 'Claude';
+    const L = (...a) => { try { console.log('[claude-zen][groups]', ...a); } catch {} };
+    L('promotion listener installed');
     const promote = async (tabId) => {
       const st = await getState();
       const gid = st.memb[tabId];
-      if (gid == null || !st.meta[gid]) return;        // not a Claude-managed tab
-      if (!(await isGroupable(tabId))) return;          // still privileged (e.g. about:newtab)
+      if (gid == null || !st.meta[gid]) return;        // not a Claude-managed tab (silent: fires for every tab)
+      L('promote attempt tab', tabId, 'gid', gid, 'native', !!st.meta[gid].native);
+      if (!(await isGroupable(tabId))) { L('skip', tabId, 'not groupable'); return; } // still privileged
       // Where should it go? A native-backed group is its own visible group; an
       // emulated group gets a lazily-created sibling native group (visualGroupId).
       let target = st.meta[gid].native ? gid : st.meta[gid].visualGroupId;
       if (target != null && _natTgGet) { try { await _natTgGet(target); } catch { target = null; } }
       let cur; try { cur = await _natGet(tabId); } catch { return; }
       if (cur && typeof cur.groupId === 'number' && cur.groupId === target) return; // already there
-      if (target != null) {
-        await _natGroup({ tabIds: [tabId], groupId: target });
-      } else {
-        const ngid = await _natGroup({ tabIds: [tabId] });
-        if (_natTgUpdate) { try { await _natTgUpdate(ngid, { title: VISUAL_TITLE, color: 'orange' }); } catch {} }
-        const fresh = await getState();
-        if (fresh.meta[gid]) { fresh.meta[gid].visualGroupId = ngid; await save({ [K_META]: fresh.meta }); }
-      }
+      try {
+        if (target != null) {
+          await _natGroup({ tabIds: [tabId], groupId: target });
+          L('added tab', tabId, '→ native group', target);
+        } else {
+          const ngid = await _natGroup({ tabIds: [tabId] });
+          if (_natTgUpdate) { try { await _natTgUpdate(ngid, { title: VISUAL_TITLE, color: 'orange' }); } catch (e) { L('title/color failed (FF<139?)', e && e.message); } }
+          const fresh = await getState();
+          if (fresh.meta[gid]) { fresh.meta[gid].visualGroupId = ngid; await save({ [K_META]: fresh.meta }); }
+          L('created native group', ngid, 'for registry group', gid, 'tab', tabId);
+        }
+      } catch (e) { L('promote FAILED tab', tabId, e && e.message); }
     };
     let chain = Promise.resolve();
+    const enqueue = (tabId) => { chain = chain.then(() => promote(tabId)).catch(() => {}); };
+    // Trigger 1: a tracked tab finished (re)navigating to a real URL.
     api.tabs.onUpdated.addListener((tabId, info) => {
-      if (info && (info.status === 'complete' || typeof info.url === 'string')) {
-        chain = chain.then(() => promote(tabId)).catch(() => {});
-      }
+      if (info && (info.status === 'complete' || typeof info.url === 'string')) enqueue(tabId);
     });
+    // Trigger 2: a tab GAINS group membership. Covers the bundle grouping a tab AFTER it
+    // already finished navigating — in that order onUpdated 'complete' fired too early
+    // (tab not yet in the registry) and promote() bailed silently. storage.onChanged also
+    // catches grouping done in the sidepanel context (this listener lives in background).
+    if (store && api.storage && api.storage.onChanged) {
+      api.storage.onChanged.addListener((changes) => {
+        const ch = changes[K_MEMB];
+        if (!ch) return;
+        const oldM = ch.oldValue || {}, newM = ch.newValue || {};
+        for (const tid in newM) {
+          if (oldM[tid] !== newM[tid]) enqueue(Number(tid));
+        }
+      });
+    }
   }
 
   // Seed the session's main tab into a Claude group. The upstream bundle only ever
