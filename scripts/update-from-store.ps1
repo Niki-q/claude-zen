@@ -9,6 +9,8 @@ $ProjectRoot  = Split-Path $PSScriptRoot -Parent
 $Protected = @(
     "manifest.json",
     "firefox-page-shims.js",
+    "firefox-threads.js",
+    "firefox-thread-jump.js",
     "firefox-bg-loader.js",
     "firefox-oauth-bridge.js",
     "firefox-oauth-relay.js",
@@ -116,7 +118,7 @@ foreach ($page in $ShimPages) {
 
     # Inject shim tag if missing
     if ($html -notmatch 'firefox-page-shims\.js') {
-        $html = $html -replace '(\s*)(<script type="module")', '$1<script src="/firefox-page-shims.js"></script>$1$2'
+        $html = $html -replace '(\s*)(<script type="module")', '$1<script src="/firefox-page-shims.js"></script>$1<script src="/firefox-threads.js"></script>$1$2'
     }
 
     # sidepanel.html only: defer the bundle's module script so the shim can

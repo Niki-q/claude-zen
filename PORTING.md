@@ -14,7 +14,8 @@ runs on Firefox 128+.
 | `firefox-oauth-bridge.js` / `-relay.js` | claude.ai page (MAIN / ISOLATED) | OAuth flow relay (chrome.identity has no Firefox equivalent). |
 | `firefox-input-blocker.js` | content (ISOLATED, all frames) | Blocks user input while the agent drives a tab. Also shims `chrome.dom` in the content world. |
 | `firefox-console-hook.js` / `-relay.js` | content (MAIN / ISOLATED) | Captures page console/errors → CDP `Runtime.*` events. Gated; off unless the agent enables it. |
-| `firefox-idle-panel.html` / `.js` | sidebar panel | Placeholder shown on tabs outside Claude's working group. |
+| `firefox-threads.js` | background + sidepanel | Thread switcher: dropdown + jump-to-tab to repoint the single global sidebar between Claude sessions without reloading. |
+| `firefox-thread-jump.js` | content (`<all_urls>`, top frame) | "◆ Open in Claude" button that repoints the open sidebar to that page's thread. |
 | `offscreen.js` + `gif.js` | background | Loaded into the background page (which has a DOM in FF) instead of a Chrome offscreen document. |
 
 ## What was ported (chronological, all on `main`)

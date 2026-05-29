@@ -4,3 +4,7 @@
 # OS / editor junk
 .DS_Store
 Thumbs.db
+
+# Transient debug captures (console exports, tab error dumps)
+console-export-*.log
+tab-error.log

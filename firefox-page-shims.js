@@ -69,7 +69,18 @@ if (typeof window !== 'undefined' && typeof window.fetch === 'function') {
       }
     } catch (e) { console.warn('[claude-zen] fetch header inject failed:', e?.message); }
 
+    // Debug mirror (opt-in): log the outgoing user turn / tool results.
+    const _czIsMessages = url.includes('api.anthropic.com') && url.includes('/messages');
+    if (_czIsMessages && self.__czDebug && self.__czDebug.enabled) {
+      try { self.__czDebug.logRequest(input, init); } catch {}
+    }
+
     const resp = await _origFetch.call(this, input, init);
+
+    // Debug mirror (opt-in): tee the SSE response → console (non-destructive).
+    if (_czIsMessages && self.__czDebug && self.__czDebug.enabled) {
+      try { self.__czDebug.tee(resp); } catch {}
+    }
     try {
       if (url.includes('api.anthropic.com') && (resp.status === 401 || resp.status === 403)) {
         const body = await resp.clone().text();
@@ -79,6 +90,171 @@ if (typeof window !== 'undefined' && typeof window.fetch === 'function') {
     return resp;
   };
 }
+
+// ── Debug mirror: tee the chat to the console ─────────────────────────────────
+// Optional dev aid. When enabled, mirrors everything that flows through the chat
+// to the console: outgoing user turns and tool results (from the request body),
+// and the assistant's text, thinking blocks, and tool_use calls WITH their args
+// (parsed from the streaming SSE response). This complements the bundle's own
+// "[Computer Tool]" logs (PermissionManager-*.js), which only cover tool execution.
+// Non-destructive: the response is read via resp.clone(), so the bundle still gets
+// the untouched original stream. Toggle from the sidepanel console (right-click the
+// sidebar → Inspect, or about:debugging → this Firefox → Inspect):
+//     czDebug()        // enable
+//     czDebug(false)   // disable
+// State persists in storage.local.__czDebugMirror and propagates across contexts.
+(function () {
+  const api = (typeof browser !== 'undefined' ? browser : chrome);
+  const store = (api && api.storage && api.storage.local) || null;
+  const FLAG = '__czDebugMirror';
+  let enabled = false;
+
+  const C = {
+    user:   'color:#2563eb;font-weight:bold',
+    text:   'color:#16a34a',
+    think:  'color:#9333ea;font-style:italic',
+    tool:   'color:#d97706;font-weight:bold',
+    result: 'color:#0891b2',
+    meta:   'color:#6b7280',
+  };
+  const trunc = (s, n = 4000) => {
+    s = (s == null) ? '' : String(s);
+    return s.length > n ? s.slice(0, n) + `… [+${s.length - n} chars]` : s;
+  };
+  const log = (kind, msg) => {
+    try { console.log(`%c[claude-zen][chat] ${msg}`, C[kind] || C.meta); } catch {}
+  };
+  const banner = () => log('meta', 'chat mirror enabled — thoughts, tool calls & results will print here');
+
+  // Parse the Anthropic SSE stream (a clone) and print each block once it completes.
+  async function parseStream(stream) {
+    const reader = stream.getReader();
+    const dec = new TextDecoder();
+    const blocks = {};
+    let buf = '';
+    try {
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buf += dec.decode(value, { stream: true });
+        let i;
+        while ((i = buf.indexOf('\n\n')) >= 0) {
+          handleEvent(buf.slice(0, i), blocks);
+          buf = buf.slice(i + 2);
+        }
+      }
+    } catch {}
+  }
+
+  function handleEvent(raw, blocks) {
+    let data = '';
+    for (const ln of raw.split('\n')) if (ln.startsWith('data:')) data += ln.slice(5).trim();
+    if (!data || data === '[DONE]') return;
+    let ev; try { ev = JSON.parse(data); } catch { return; }
+    switch (ev.type) {
+      case 'message_start':
+        log('meta', `▶ message start${ev.message && ev.message.model ? ' — ' + ev.message.model : ''}`);
+        break;
+      case 'content_block_start': {
+        const b = ev.content_block || {};
+        blocks[ev.index] = { type: b.type, text: '', json: '', name: b.name };
+        if (b.type === 'tool_use') log('tool', `🔧 tool call: ${b.name}`);
+        break;
+      }
+      case 'content_block_delta': {
+        const b = blocks[ev.index] || (blocks[ev.index] = { type: '', text: '', json: '' });
+        const d = ev.delta || {};
+        if (d.type === 'text_delta') b.text += d.text || '';
+        else if (d.type === 'thinking_delta') b.text += d.thinking || '';
+        else if (d.type === 'input_json_delta') b.json += d.partial_json || '';
+        break;
+      }
+      case 'content_block_stop': {
+        const b = blocks[ev.index]; if (!b) break;
+        if (b.type === 'thinking') log('think', `💭 thinking:\n${trunc(b.text)}`);
+        else if (b.type === 'text') log('text', `💬 assistant:\n${trunc(b.text)}`);
+        else if (b.type === 'tool_use') {
+          let input = b.json;
+          try { input = JSON.stringify(JSON.parse(b.json || '{}'), null, 2); } catch {}
+          log('tool', `🔧 ${b.name || 'tool'} args:\n${trunc(input)}`);
+        }
+        delete blocks[ev.index];
+        break;
+      }
+      case 'message_delta':
+        if (ev.delta && ev.delta.stop_reason)
+          log('meta', `■ stop: ${ev.delta.stop_reason}${ev.usage ? ' · usage ' + JSON.stringify(ev.usage) : ''}`);
+        break;
+      case 'message_stop':
+        log('meta', '■ message complete');
+        break;
+      case 'error':
+        log('meta', `⚠ error: ${trunc(JSON.stringify(ev.error || ev))}`);
+        break;
+    }
+  }
+
+  // Print the newest message in an outgoing request body (user input + tool results).
+  function printRequest(bodyStr) {
+    let obj; try { obj = JSON.parse(bodyStr); } catch { return; }
+    if (!obj || !Array.isArray(obj.messages) || !obj.messages.length) return;
+    const last = obj.messages[obj.messages.length - 1];
+    if (!last) return;
+    const role = last.role || 'user';
+    if (typeof last.content === 'string') { log('user', `👤 ${role}:\n${trunc(last.content)}`); return; }
+    if (!Array.isArray(last.content)) return;
+    for (const c of last.content) {
+      if (!c || !c.type) continue;
+      if (c.type === 'text') log('user', `👤 ${role}: ${trunc(c.text)}`);
+      else if (c.type === 'image') log('user', '👤 [image]');
+      else if (c.type === 'tool_result') {
+        let body = c.content;
+        if (Array.isArray(body))
+          body = body.map(x => x && x.type === 'text' ? x.text
+            : x && x.type === 'image' ? '[image]' : `[${(x && x.type) || '?'}]`).join('\n');
+        log('result', `✅ tool result${c.is_error ? ' [ERROR]' : ''}${c.tool_use_id ? ' (' + c.tool_use_id + ')' : ''}:\n${trunc(body)}`);
+      }
+    }
+  }
+
+  // Public hooks called by the window.fetch wrapper above.
+  self.__czDebug = {
+    get enabled() { return enabled; },
+    logRequest(input, init) {
+      try {
+        const body = init && init.body;
+        if (typeof body === 'string') { printRequest(body); return; }
+        // Request object: read a clone so the real body isn't consumed.
+        if (input && typeof input.clone === 'function') {
+          input.clone().text().then(printRequest).catch(() => {});
+        }
+      } catch {}
+    },
+    tee(resp) {
+      try {
+        const ct = (resp.headers && resp.headers.get('content-type')) || '';
+        if (!resp.body || !/event-stream/.test(ct)) return;
+        parseStream(resp.clone().body).catch(() => {});
+      } catch {}
+    },
+  };
+
+  // Console toggle: czDebug() → on, czDebug(false) → off.
+  self.czDebug = function (on) {
+    enabled = (on === undefined) ? true : !!on;
+    if (store) { try { store.set({ [FLAG]: enabled }); } catch {} }
+    log('meta', `mirror ${enabled ? 'ON' : 'OFF'}`);
+    return enabled;
+  };
+
+  // Load the persisted flag and react to toggles from other contexts.
+  if (store) { try { store.get(FLAG).then((o) => { if (o && o[FLAG]) { enabled = true; banner(); } }); } catch {} }
+  try {
+    api.storage.onChanged.addListener((ch, area) => {
+      if (area === 'local' && ch && ch[FLAG]) { enabled = !!ch[FLAG].newValue; if (enabled) banner(); }
+    });
+  } catch {}
+})();
 
 // ── chrome.tabs.query: Firefox sidebar workaround ─────────────────────────────
 // In Firefox sidebar context, tabs.query({active:true,currentWindow:true})
@@ -150,6 +326,38 @@ if (chrome.tabs && chrome.tabs.query) {
     return handle();
   };
 }
+
+// ── chrome.tabs.create / windows.create: Chrome new-tab URL → Firefox ─────────
+// The upstream bundle opens scratch tabs with url:"chrome://newtab" (Chrome's
+// new-tab page) in tabs_create, browser_batch's tabs_create, and the session-group
+// fallback paths. Firefox rejects that scheme — "Illegal URL: chrome://newtab" —
+// so every new-tab creation fails (observed: "open two tabs" could open only one).
+// chrome:// is privileged in Firefox; there is no settable equivalent of Chrome's
+// new-tab URL, so we drop the url entirely and let Firefox open its native new tab
+// (the bundle navigates it immediately afterwards anyway).
+(function () {
+  const NEWTAB = /^chrome:\/\/(newtab|new-tab-page)\/?$/i;
+  const fix = (o) => {
+    if (o && typeof o.url === 'string' && NEWTAB.test(o.url)) {
+      const c = { ...o };
+      delete c.url;
+      return c;
+    }
+    return o;
+  };
+  if (chrome.tabs && typeof chrome.tabs.create === 'function') {
+    const _create = chrome.tabs.create.bind(chrome.tabs);
+    chrome.tabs.create = function (opts, cb) {
+      return (typeof cb === 'function') ? _create(fix(opts), cb) : _create(fix(opts));
+    };
+  }
+  if (chrome.windows && typeof chrome.windows.create === 'function') {
+    const _wcreate = chrome.windows.create.bind(chrome.windows);
+    chrome.windows.create = function (opts, cb) {
+      return (typeof cb === 'function') ? _wcreate(fix(opts), cb) : _wcreate(fix(opts));
+    };
+  }
+})();
 
 // ── Firefox: inject ?tabId=N into sidepanel URL before bundle loads ──────────
 // Chrome's bundle reads tabId from `sidepanel.html?tabId=N` (URL param set by
@@ -240,6 +448,9 @@ if (typeof document !== 'undefined' &&
             url.searchParams.set('tabId', String(pick.id));
             try { history.replaceState({}, '', url); } catch (e) { console.warn(`${LOG} replaceState failed`, e); }
             console.log(`${LOG} active tabId resolved: ${pick.id}`);
+            // Put the main tab in a Claude group so newly created tabs can join it
+            // and pass the bundle's same-group access gate (see __ffEnsureMainGroup).
+            try { if (self.__ffEnsureMainGroup) await self.__ffEnsureMainGroup(pick.id); } catch {}
           } else {
             console.warn(`${LOG} could not resolve an active tab — bundle may show "No active tab"`);
           }
@@ -259,52 +470,183 @@ if (typeof document !== 'undefined' &&
   })();
 }
 
-// ── Tab Groups emulation (Firefox has no chrome.tabGroups / tabs.group) ───────
+// ── Tab Groups (HYBRID: native on FF 139+, storage-emulation fallback) ────────
 // Chrome's bundle uses real OS tab groups to corral the tabs Claude drives, and
 // re-finds them on invoke via tabs.query({groupId}) / tab.groupId / tabGroups.*.
-// Firefox 128 has no grouping API, so without this the group is lost on every
-// invocation and Claude can't see "its" tabs. We emulate a LOGICAL group: a
-// registry kept in storage.session (shared across background + sidepanel,
-// survives SW unload, cleared on browser restart) mapping tabId→groupId plus
-// per-group metadata. There is no visual group in the Firefox UI, but every API
-// the bundle relies on behaves consistently, so the orchestration works.
+// It only ever acts on tabs whose group matches the session's group (bailing when
+// tab.groupId === TAB_GROUP_ID_NONE), so the group IS the access boundary.
+//
+// The hard problem on Firefox: native chrome.tabs.group (FF 139+) REFUSES to group
+// privileged/extension pages (moz-extension://, about:*, chrome://). Claude's "main
+// tab" is very often exactly that (e.g. a new-tab-page override), and freshly
+// created scratch tabs open at about:newtab. If we used the native API blindly,
+// createGroup(mainTab) throws → no group is ever created → every new tab is "not in
+// the same group" and the agent can't control it (and "No group found for main tab").
+//
+// So we run a HYBRID with the storage registry as the unified source of truth for
+// membership:
+//   • groupable web tab  → create a REAL, visible native group; mirror it in the
+//                          registry (native:true) so queries stay consistent.
+//   • privileged tab / native rejection / FF ≤138 → emulate a LOGICAL group with a
+//                          negative id (never collides with native +ve ids or NONE).
+// chrome.tabs.get/query are overlaid so a tab's groupId comes from the registry when
+// Claude manages it, else from the native value — so both real and emulated groups,
+// plus user-made native groups, all report consistently. The registry lives in
+// storage.session (shared bg+sidepanel, survives SW unload, cleared on restart).
 (function () {
   const api = (typeof browser !== 'undefined' ? browser : chrome);
   const store = api.storage && (api.storage.session || api.storage.local);
   const NONE = -1;
   const K_META = '__ffGroupMeta', K_MEMB = '__ffTabGroup', K_SEQ = '__ffGroupSeq';
-  const isBackground = (typeof document === 'undefined');
+  // Detect the background context. On Chrome MV3 the background is a service worker
+  // (no `document`). On FIREFOX MV3 the background is a real DOM page (document EXISTS),
+  // so the old `typeof document === 'undefined'` test was always false there — meaning
+  // the background-only listeners (visual promotion, onRemoved pruning) NEVER installed.
+  // Identify Firefox's background by its generated page URL / getBackgroundPage identity.
+  const isBackground = (() => {
+    if (typeof document === 'undefined') return true;            // Chrome MV3 service worker
+    try {
+      if (typeof location !== 'undefined' &&
+          /_generated_background_page\.html$/.test(location.pathname || '')) return true;
+    } catch {}
+    try {
+      if (chrome.extension && typeof chrome.extension.getBackgroundPage === 'function' &&
+          chrome.extension.getBackgroundPage() === window) return true;
+    } catch {}
+    return false;
+  })();
+
+  // FF 139+ exposes chrome.tabGroups + chrome.tabs.group natively.
+  const nativeGroups = (typeof chrome.tabGroups !== 'undefined' &&
+                        typeof chrome.tabGroups.TAB_GROUP_ID_NONE === 'number');
+
+  // Capture natives BEFORE we override anything. group/ungroup come from `browser`
+  // (Promise-based); get/query are the already-installed sidebar-aware wrappers.
+  const _natGroup   = (api.tabs && typeof api.tabs.group === 'function')   ? api.tabs.group.bind(api.tabs)   : null;
+  const _natUngroup = (api.tabs && typeof api.tabs.ungroup === 'function') ? api.tabs.ungroup.bind(api.tabs) : null;
+  const _natGet     = chrome.tabs ? chrome.tabs.get.bind(chrome.tabs)      : null;
+  const _natQuery   = chrome.tabs ? chrome.tabs.query.bind(chrome.tabs)    : null;
+  const _natTgGet    = (chrome.tabGroups && chrome.tabGroups.get)    ? chrome.tabGroups.get.bind(chrome.tabGroups)    : null;
+  const _natTgUpdate = (chrome.tabGroups && chrome.tabGroups.update) ? chrome.tabGroups.update.bind(chrome.tabGroups) : null;
+
+  // CRITICAL: tabs.group() shipped in Firefox 138; the tabGroups *namespace*
+  // (TAB_GROUP_ID_NONE, tabGroups.update for title/color) only in Firefox 139.
+  // Gate the creation of VISIBLE native groups on the method (canGroup), NOT on the
+  // namespace (nativeGroups) — otherwise FF 138 users get no visible group at all.
+  // nativeGroups stays the gate only for the title/color overlay (FF 139+).
+  const canGroup = typeof _natGroup === 'function';
+  if (isBackground) {
+    try {
+      console.log('[claude-zen][groups] init',
+        'ff=' + (((typeof navigator !== 'undefined' && navigator.userAgent) || '').match(/Firefox\/[\d.]+/) || ['?'])[0],
+        'tabs.group=' + canGroup, 'tabGroups.ns=' + nativeGroups, 'tabGroups.update=' + !!_natTgUpdate);
+    } catch {}
+  }
+
+  // Tabs showing these schemes cannot be placed in a native Firefox tab group.
+  const PRIVILEGED = /^(moz-extension|chrome-extension|about|chrome|view-source|data|resource|file):/i;
+  const isGroupable = async (id) => {
+    if (!canGroup || !_natGet) return false;
+    try { const t = await _natGet(id); const u = t && t.url; return !!u && !PRIVILEGED.test(u); }
+    catch { return false; }
+  };
 
   const getState = async () => {
-    if (!store) return { meta: {}, memb: {}, seq: 1000 };
+    if (!store) return { meta: {}, memb: {}, seq: 0 };
     const o = await store.get([K_META, K_MEMB, K_SEQ]);
-    return { meta: o[K_META] || {}, memb: o[K_MEMB] || {}, seq: o[K_SEQ] || 1000 };
+    return { meta: o[K_META] || {}, memb: o[K_MEMB] || {}, seq: o[K_SEQ] || 0 };
   };
   const save = async (obj) => { if (store) await store.set(obj); };
   const toIds = (x) => (Array.isArray(x) ? x : (x != null ? [x] : [])).map(Number);
 
-  const groupFn = async (opts = {}) => {
+  // Emulated (logical) group — negative ids so they never collide with native.
+  const emulatedGroup = async (opts = {}) => {
     const ids = toIds(opts.tabIds);
     const st = await getState();
     let gid = opts.groupId;
-    if (gid == null) {
-      gid = st.seq + 1; st.seq = gid;
+    if (gid == null || !st.meta[gid]) {
+      if (gid == null) {
+        gid = (typeof st.seq === 'number' && st.seq <= -1000 ? st.seq : -999) - 1;
+        st.seq = gid;
+      }
       let windowId;
-      try { windowId = (await api.tabs.get(ids[0])).windowId; } catch {}
-      st.meta[gid] = { id: gid, title: '', color: 'grey', collapsed: false, windowId };
-    } else if (!st.meta[gid]) {
-      st.meta[gid] = { id: gid, title: '', color: 'grey', collapsed: false };
+      try { windowId = (await _natGet(ids[0])).windowId; } catch {}
+      st.meta[gid] = { id: gid, title: '', color: 'grey', collapsed: false, windowId, native: false, mainTabId: ids[0] };
     }
     for (const id of ids) st.memb[id] = gid;
     await save({ [K_META]: st.meta, [K_MEMB]: st.memb, [K_SEQ]: st.seq });
     return gid;
   };
 
+  const groupFn = async (opts = {}) => {
+    const ids = toIds(opts.tabIds);
+    const st = await getState();
+    const gid = opts.groupId;
+
+    // Adding to a group Claude already tracks (native-backed or emulated).
+    if (gid != null && st.meta[gid]) {
+      if (st.meta[gid].native && _natGroup) {
+        const ok = [];
+        for (const id of ids) if (await isGroupable(id)) ok.push(id);
+        if (ok.length) { try { await _natGroup({ tabIds: ok, groupId: gid }); } catch {} }
+      }
+      for (const id of ids) st.memb[id] = gid;
+      await save({ [K_MEMB]: st.memb });
+      return gid;
+    }
+
+    // Dedup: the bundle's createGroup(mainTab) calls group() with NO groupId whenever it
+    // can't find the group in its own (empty) metadata Map — so it tries to make a SECOND
+    // native group for a session we already track, racing our promotion and splitting the
+    // initial tab away from the new ones. If any incoming tab is already in a registry
+    // group, route all of them into THAT group instead of creating a new one.
+    if (gid == null) {
+      const existing = ids.map((id) => st.memb[id]).find((g) => g != null && st.meta[g]);
+      if (existing != null) {
+        if (st.meta[existing].native && _natGroup) {
+          const ok = [];
+          for (const id of ids) if (await isGroupable(id)) ok.push(id);
+          if (ok.length) { try { await _natGroup({ tabIds: ok, groupId: existing }); } catch {} }
+        }
+        for (const id of ids) st.memb[id] = existing;
+        await save({ [K_MEMB]: st.memb });
+        return existing;
+      }
+    }
+
+    // New group from groupable tabs → real native group, mirrored into the registry.
+    if (gid == null && canGroup && _natGroup) {
+      let allOk = ids.length > 0;
+      for (const id of ids) if (!(await isGroupable(id))) { allOk = false; break; }
+      if (allOk) {
+        try {
+          const ngid = await _natGroup(opts);
+          let windowId;
+          try { windowId = (await _natGet(ids[0])).windowId; } catch {}
+          const fresh = await getState();
+          fresh.meta[ngid] = { id: ngid, title: '', color: 'grey', collapsed: false, windowId, native: true, mainTabId: ids[0] };
+          for (const id of ids) fresh.memb[id] = ngid;
+          await save({ [K_META]: fresh.meta, [K_MEMB]: fresh.memb });
+          return ngid;
+        } catch {}
+      }
+    }
+
+    // Fallback: privileged tabs, native rejection, or FF ≤138 → emulate.
+    return emulatedGroup(opts);
+  };
+
   const ungroupFn = async (tabIds) => {
     const ids = toIds(tabIds);
     const st = await getState();
-    for (const id of ids) delete st.memb[id];
+    const nativeIds = [];
+    for (const id of ids) {
+      const gid = st.memb[id];
+      if (gid != null && st.meta[gid] && st.meta[gid].native) nativeIds.push(id);
+      delete st.memb[id];
+    }
     await save({ [K_MEMB]: st.memb });
+    if (nativeIds.length && _natUngroup) { try { await _natUngroup(nativeIds); } catch {} }
   };
 
   // Promise/callback adapter matching the WebExtension dual signature.
@@ -319,19 +661,22 @@ if (typeof document !== 'undefined' &&
     chrome.tabs.group   = dual(groupFn, () => NONE);
     chrome.tabs.ungroup = dual(ungroupFn);
 
-    // Wrap query: strip the FF-unsupported groupId filter, annotate each tab's
-    // groupId from the registry, and apply groupId filtering ourselves.
-    const _q = chrome.tabs.query.bind(chrome.tabs);
+    // Overlay query: registry membership wins; otherwise keep the native groupId.
+    // groupId filtering is applied here so it works for native (+ve) and emulated
+    // (-ve) ids alike.
     chrome.tabs.query = function (queryInfo, callback) {
       const qi = { ...(queryInfo || {}) };
       const wantGroup = Object.prototype.hasOwnProperty.call(qi, 'groupId');
       const gid = qi.groupId;
       delete qi.groupId;
       const run = async () => {
-        let tabs = (await _q(qi)) || [];
+        let tabs = (await _natQuery(qi)) || [];
         const st = await getState();
         for (const t of tabs) {
-          if (t && typeof t.id === 'number') t.groupId = (st.memb[t.id] != null ? st.memb[t.id] : NONE);
+          if (t && typeof t.id === 'number') {
+            if (st.memb[t.id] != null) t.groupId = st.memb[t.id];
+            else if (typeof t.groupId !== 'number') t.groupId = NONE;
+          }
         }
         if (wantGroup) tabs = tabs.filter((t) => t.groupId === gid);
         return tabs;
@@ -340,20 +685,22 @@ if (typeof document !== 'undefined' &&
       return run();
     };
 
-    // Wrap get: annotate groupId on the single tab.
-    const _get = chrome.tabs.get.bind(chrome.tabs);
+    // Overlay get: same precedence — registry first, else native groupId.
     chrome.tabs.get = function (tabId, callback) {
       const run = async () => {
-        const t = await _get(tabId);
+        const t = await _natGet(tabId);
         const st = await getState();
-        if (t) t.groupId = (st.memb[tabId] != null ? st.memb[tabId] : NONE);
+        if (t) {
+          if (st.memb[tabId] != null) t.groupId = st.memb[tabId];
+          else if (typeof t.groupId !== 'number') t.groupId = NONE;
+        }
         return t;
       };
       if (typeof callback === 'function') { run().then(callback, () => callback(undefined)); return; }
       return run();
     };
 
-    // Prune membership when a grouped tab closes (background owns this once).
+    // Prune membership when a tracked tab closes (background owns this once).
     if (isBackground && api.tabs.onRemoved) {
       api.tabs.onRemoved.addListener(async (tabId) => {
         try {
@@ -364,7 +711,53 @@ if (typeof document !== 'undefined' &&
     }
   }
 
-  if (!chrome.tabGroups) {
+  if (nativeGroups && chrome.tabGroups) {
+    // Overlay native tabGroups so Claude's groups (real OR emulated) resolve from the
+    // registry, while user-made native groups still pass through.
+    const _tgGet    = chrome.tabGroups.get    ? chrome.tabGroups.get.bind(chrome.tabGroups)    : null;
+    const _tgQuery  = chrome.tabGroups.query  ? chrome.tabGroups.query.bind(chrome.tabGroups)  : null;
+    const _tgUpdate = chrome.tabGroups.update ? chrome.tabGroups.update.bind(chrome.tabGroups) : null;
+    const _tgMove   = chrome.tabGroups.move   ? chrome.tabGroups.move.bind(chrome.tabGroups)   : null;
+
+    chrome.tabGroups.get = async (id) => {
+      const st = await getState();
+      if (st.meta[id]) {
+        if (st.meta[id].native && _tgGet) { try { return await _tgGet(id); } catch {} }
+        return { ...st.meta[id] };
+      }
+      if (_tgGet) return _tgGet(id);
+      throw new Error(`No group with id: ${id}`);
+    };
+    chrome.tabGroups.query = async (qi = {}) => {
+      const st = await getState();
+      let nat = [];
+      if (_tgQuery) { try { nat = (await _tgQuery(qi)) || []; } catch {} }
+      const emu = Object.values(st.meta).filter((g) => !g.native).filter((g) =>
+        (qi.windowId == null || g.windowId === qi.windowId) &&
+        (qi.title == null || g.title === qi.title) &&
+        (qi.color == null || g.color === qi.color) &&
+        (qi.collapsed == null || g.collapsed === qi.collapsed)
+      ).map((g) => ({ ...g }));
+      return nat.concat(emu);
+    };
+    chrome.tabGroups.update = async (id, props) => {
+      const st = await getState();
+      if (st.meta[id]) {
+        Object.assign(st.meta[id], props || {});
+        await save({ [K_META]: st.meta });
+        if (st.meta[id].native && _tgUpdate) { try { return await _tgUpdate(id, props); } catch {} }
+        return { ...st.meta[id] };
+      }
+      if (_tgUpdate) return _tgUpdate(id, props);
+      return { id, ...(props || {}) };
+    };
+    chrome.tabGroups.move = async (id, props) => {
+      if (_tgMove) { try { return await _tgMove(id, props); } catch {} }
+      const st = await getState();
+      return { ...(st.meta[id] || { id }) };
+    };
+  } else if (!chrome.tabGroups) {
+    // FF ≤138: no native API at all — provide the full emulated object.
     chrome.tabGroups = {
       TAB_GROUP_ID_NONE: NONE,
       Color: {
@@ -387,7 +780,7 @@ if (typeof document !== 'undefined' &&
       },
       update: async (id, props) => {
         const st = await getState();
-        const m = st.meta[id] || { id, title: '', color: 'grey', collapsed: false };
+        const m = st.meta[id] || { id, title: '', color: 'grey', collapsed: false, native: false };
         Object.assign(m, props || {});
         st.meta[id] = m;
         await save({ [K_META]: st.meta });
@@ -403,6 +796,106 @@ if (typeof document !== 'undefined' &&
       onRemoved: { addListener: () => {}, removeListener: () => {}, hasListener: () => false },
     };
   }
+
+  // Make Claude's groups VISIBLE as real Firefox tab groups. The registry stays the
+  // membership source of truth (so the access gate is unaffected); this only mirrors
+  // groupable members into a native group for the user to see. New tabs are privileged
+  // at creation (about:newtab) and can't be natively grouped until they navigate to a
+  // real URL — so we promote them on navigation. Promotions are serialized so several
+  // tabs navigating at once (e.g. browser_batch) land in ONE native group, not many.
+  if (isBackground && canGroup && _natGroup && api.tabs && api.tabs.onUpdated) {
+    const VISUAL_TITLE = 'Claude';
+    const L = (...a) => { try { console.log('[claude-zen][groups]', ...a); } catch {} };
+    L('promotion listener installed');
+    const promote = async (tabId) => {
+      const st = await getState();
+      const gid = st.memb[tabId];
+      if (gid == null || !st.meta[gid]) return;        // not a Claude-managed tab (silent: fires for every tab)
+      L('promote attempt tab', tabId, 'gid', gid, 'native', !!st.meta[gid].native);
+      if (!(await isGroupable(tabId))) { L('skip', tabId, 'not groupable'); return; } // still privileged
+      // Where should it go? A native-backed group is its own visible group; an
+      // emulated group gets a lazily-created sibling native group (visualGroupId).
+      let target = st.meta[gid].native ? gid : st.meta[gid].visualGroupId;
+      if (target != null && _natTgGet) { try { await _natTgGet(target); } catch { target = null; } }
+      let cur; try { cur = await _natGet(tabId); } catch { return; }
+      if (cur && typeof cur.groupId === 'number' && cur.groupId === target) return; // already there
+      try {
+        if (target != null) {
+          await _natGroup({ tabIds: [tabId], groupId: target });
+          L('added tab', tabId, '→ native group', target);
+        } else {
+          const ngid = await _natGroup({ tabIds: [tabId] });
+          if (_natTgUpdate) { try { await _natTgUpdate(ngid, { title: VISUAL_TITLE, color: 'orange' }); } catch (e) { L('title/color failed (FF<139?)', e && e.message); } }
+          const fresh = await getState();
+          if (fresh.meta[gid]) { fresh.meta[gid].visualGroupId = ngid; await save({ [K_META]: fresh.meta }); }
+          L('created native group', ngid, 'for registry group', gid, 'tab', tabId);
+        }
+      } catch (e) { L('promote FAILED tab', tabId, e && e.message); }
+    };
+    let chain = Promise.resolve();
+    const enqueue = (tabId) => { chain = chain.then(() => promote(tabId)).catch(() => {}); };
+    // Trigger 1: a tracked tab finished (re)navigating to a real URL.
+    api.tabs.onUpdated.addListener((tabId, info) => {
+      if (info && (info.status === 'complete' || typeof info.url === 'string')) enqueue(tabId);
+    });
+    // Trigger 2: a tab GAINS group membership. Covers the bundle grouping a tab AFTER it
+    // already finished navigating — in that order onUpdated 'complete' fired too early
+    // (tab not yet in the registry) and promote() bailed silently. storage.onChanged also
+    // catches grouping done in the sidepanel context (this listener lives in background).
+    if (store && api.storage && api.storage.onChanged) {
+      api.storage.onChanged.addListener((changes) => {
+        const ch = changes[K_MEMB];
+        if (!ch) return;
+        const oldM = ch.oldValue || {}, newM = ch.newValue || {};
+        for (const tid in newM) {
+          if (oldM[tid] !== newM[tid]) enqueue(Number(tid));
+        }
+      });
+    }
+  }
+
+  // Seed the session's main tab into a Claude group. The upstream bundle only ever
+  // groups the main tab through its MCP/session-group tools — for a plain "open a
+  // tab" flow it NEVER calls createGroup, so the main tab's groupId stays NONE,
+  // tabs_create's `if (mainTab.groupId !== NONE)` guard skips grouping the new tab,
+  // and the access gate rejects every new tab ("not in the same group"). By putting
+  // the main tab in a group here, get(mainTab).groupId becomes non-NONE → the bundle
+  // groups freshly created tabs into it → the gate's findGroupByTab reconstructs the
+  // group from chrome.tabs.query({groupId}) (our overlay) and access is granted.
+  // Idempotent; native group when the tab is groupable, emulated otherwise.
+  self.__ffEnsureMainGroup = async (tabId, opts = {}) => {
+    try {
+      if (tabId == null || !chrome.tabs) return;
+      // The conversation's main tab is often a PRIVILEGED page (about:blank /
+      // about:newtab / a new-tab override) that Firefox refuses to put in a VISIBLE
+      // tab group — so it shows as "groupless" while the agent's scratch tabs (which
+      // navigate to real URLs) form the visible group. On explicit chat init / new
+      // thread (makeGroupable), send that tab to a real, groupable page first so it
+      // can visibly join the group. Real pages are left untouched.
+      if (opts.makeGroupable) {
+        try {
+          const t = await _natGet(tabId);
+          const u = t && t.url;
+          if (!u || PRIVILEGED.test(u)) {
+            await chrome.tabs.update(tabId, { url: 'https://duckduckgo.com' });
+            console.log('[claude-zen][groups] ensureMainGroup: navigated privileged main tab', tabId, '→ duckduckgo.com');
+          }
+        } catch (e) {}
+      }
+      const st = await getState();
+      if (st.memb[tabId] != null) {
+        console.log('[claude-zen][groups] ensureMainGroup: tab', tabId, 'already in group', st.memb[tabId]);
+        return;   // already in a group
+      }
+      const gid = await groupFn({ tabIds: [tabId] });
+      const fresh = await getState();
+      if (fresh.meta[gid] && fresh.meta[gid].mainTabId == null) {
+        fresh.meta[gid].mainTabId = tabId;
+        await save({ [K_META]: fresh.meta });
+      }
+      console.log('[claude-zen][groups] ensureMainGroup: grouped main tab', tabId, '→ group', gid);
+    } catch (e) { console.warn('[claude-zen][groups] ensureMainGroup FAILED', tabId, e && e.message); }
+  };
 })();
 
 // ── chrome.debugger (absent in Firefox) → translate CDP to Firefox APIs ───────
@@ -714,25 +1207,40 @@ if (!chrome.sidePanel) {
   chrome.sidePanel = {
     setOptions: async (opts) => {
       try {
-        // Remember the chat/main tab the sidebar is bound to. The tabs.onActivated
-        // handler (below) uses it to keep showing the chat across all of Claude's
-        // working-group tabs, and to swap to the idle placeholder on other tabs.
-        let chatTab = (opts && opts.tabId != null) ? Number(opts.tabId) : null;
-        if (chatTab == null && opts && opts.path) {
-          const m = /[?&]tabId=(\d+)/.exec(opts.path);
-          if (m) chatTab = Number(m[1]);
-        }
-        if (chatTab != null) {
-          window.__ffChatTabId = chatTab;
-          try { await browser.storage.session.set({ __ffChatTabId: chatTab }); } catch {}
-        }
-        if (opts && opts.path && browser.sidebarAction && browser.sidebarAction.setPanel) {
-          // Global default panel (covers initial open + the active main tab).
-          await browser.sidebarAction.setPanel({ panel: opts.path });
-          // Bind the chat tab explicitly so returning to it always shows the chat.
-          if (chatTab != null) {
-            try { await browser.sidebarAction.setPanel({ tabId: chatTab, panel: opts.path }); } catch {}
+        // Claude calls setOptions to bind the panel to a tab right as a conversation
+        // starts / a new chat opens — the reliable "a thread begins here" signal. Seed
+        // the group now so the conversation's INITIAL tab is always in a Claude group
+        // (and a switchable thread), and make it groupable if it's a privileged page.
+        try {
+          let tid = (opts && opts.tabId != null) ? Number(opts.tabId) : null;
+          if (tid == null && opts && opts.path) {
+            const m = /[?&]tabId=(\d+)/.exec(opts.path);
+            if (m) tid = Number(m[1]);
           }
+          if (tid != null && self.__ffEnsureMainGroup) await self.__ffEnsureMainGroup(tid, { makeGroupable: true });
+        } catch {}
+        if (opts && opts.path && browser.sidebarAction && browser.sidebarAction.setPanel) {
+          // IMPORTANT: set a GLOBAL panel (no tabId), unlike Chrome's per-tab
+          // sidepanel model. Firefox has a single sidebar shared across tabs; if
+          // we bind the panel to one tabId, switching to any other tab makes
+          // Firefox fall back to the default panel URL (no ?tabId) and RELOAD the
+          // sidebar document — re-initializing the whole bundle and wiping the
+          // in-progress conversation. A single global panel URL stays constant
+          // across tab switches, so the document is kept alive and state persists.
+          // The target tabId still reaches the bundle via the deferred-module
+          // loader (history.replaceState ?tabId=N + URLSearchParams.get patch).
+          //
+          // BUG FIX: opts.path is `sidepanel.html?tabId=N`. Passing it verbatim set a
+          // per-tab-id GLOBAL panel URL, contradicting the note above — on the next tab
+          // switch Firefox saw a different default panel URL and RELOADED the sidebar,
+          // wiping the in-progress conversation (the "session not saved across tabs"
+          // bug). Strip ?tabId so the global panel URL stays constant; the loader
+          // re-injects the correct tabId per document load.
+          const globalPanel = String(opts.path)
+            .replace(/[?&]tabId=\d+/g, '')
+            .replace(/\?&/, '?')
+            .replace(/[?&]$/, '');
+          await browser.sidebarAction.setPanel({ panel: globalPanel });
         }
       } catch {}
     },
@@ -743,83 +1251,20 @@ if (!chrome.sidePanel) {
   };
 }
 
-// ── Per-tab sidebar visibility: chat on Claude's working tabs, idle elsewhere ──
-// Firefox has one global sidebar. We want the chat to appear only on Claude's
-// working-group tabs and an idle placeholder on every other tab, while the agent
-// keeps running in the background. Firefox lets us swap the per-tab panel freely
-// (sidebarAction.setPanel({tabId})), but NOT reopen the sidebar programmatically
-// (open() needs a user gesture) — so we never close it, we just swap content.
-// Runs in the background page only (it owns tab events). Working tabs all share
-// the SAME chat URL (?tabId=<chatTab>) so switching among them doesn't reload;
-// crossing into/out of the group swaps URL and reloads (chat history persists).
-if (typeof location !== 'undefined' &&
-    location.pathname.endsWith('_generated_background_page.html')) {
-  (function () {
-    const api = (typeof browser !== 'undefined' ? browser : chrome);
-    const IDLE = 'firefox-idle-panel.html';
-    const NONE = -1;
-
-    const getChatTab = async () => {
-      if (window.__ffChatTabId != null) return window.__ffChatTabId;
-      try {
-        const o = await api.storage.session.get('__ffChatTabId');
-        window.__ffChatTabId = (o && o.__ffChatTabId != null) ? o.__ffChatTabId : null;
-      } catch {}
-      return window.__ffChatTabId;
-    };
-
-    const memb = async () => {
-      try {
-        const o = await api.storage.session.get('__ffTabGroup');
-        return (o && o.__ffTabGroup) || {};
-      } catch { return {}; }
-    };
-
-    // Tabs we've switched to the idle placeholder — so we can restore them when
-    // the working session ends (otherwise the per-tab override would persist).
-    const idled = new Set();
-
-    const setPanel = async (tabId, panel) => {
-      try { await api.sidebarAction.setPanel({ tabId, panel }); } catch {}
-    };
-
-    const applyPanel = async (tabId) => {
-      if (!api.sidebarAction || !api.sidebarAction.setPanel) return;
-      const chat = await getChatTab();
-      if (chat == null) return;               // nothing bound yet
-      const m = await memb();
-      const g = m[chat];
-      // Only manage visibility while Claude has an ACTIVE working group. With no
-      // group (plain chat, or session ended), leave the global chat panel on every
-      // tab — don't show the idle placeholder.
-      if (g == null || g === NONE) return;
-      const working = (tabId === chat) || (m[tabId] === g);
-      if (working) { idled.delete(tabId); await setPanel(tabId, `sidepanel.html?tabId=${chat}`); }
-      else { idled.add(tabId); await setPanel(tabId, IDLE); }
-    };
-
-    const resetIdled = async () => {
-      for (const tabId of idled) await setPanel(tabId, 'sidepanel.html');
-      idled.clear();
-    };
-
-    if (api.tabs && api.tabs.onActivated) {
-      api.tabs.onActivated.addListener((info) => { applyPanel(info.tabId); });
-    }
-    // Clear binding + restore placeholder tabs when the chat tab closes.
-    if (api.tabs && api.tabs.onRemoved) {
-      api.tabs.onRemoved.addListener(async (tabId) => {
-        const chat = await getChatTab();
-        idled.delete(tabId);
-        if (tabId === chat) {
-          window.__ffChatTabId = null;
-          try { await api.storage.session.remove('__ffChatTabId'); } catch {}
-          await resetIdled();
-        }
-      });
-    }
-  })();
-}
+// ── Per-tab sidebar visibility (idle placeholder): SUPERSEDED by thread switcher ──
+// An earlier design swapped the per-tab sidebar panel on tabs.onActivated to show
+// the chat only on Claude's working-group tabs and `firefox-idle-panel.html` on
+// every other tab. It relied on per-tab `sidebarAction.setPanel({tabId})`, which
+// is fundamentally incompatible with the thread switcher (firefox-threads.js):
+// any per-tab panel override forces Firefox to RELOAD the sidebar document when
+// the active tab changes, re-initializing the bundle and wiping the in-progress
+// conversation — exactly what the "keep sidebar alive across tab switches" fix in
+// setOptions (single constant global panel, ?tabId stripped) exists to prevent.
+// The thread switcher subsumes this feature: the sidebar now shows ONE kept-alive
+// conversation (the selected thread), and the user repoints it via the dropdown
+// (firefox-threads.js) or the "◆ Open in Claude" button (firefox-thread-jump.js),
+// decoupled from the active browser tab. The idle block is therefore removed; the
+// `__ffChatTabId` state it depended on is no longer set in setOptions.
 
 // ── chrome.offscreen → handled inline in the Firefox background page ───────────
 // Chrome needs an offscreen document because its MV3 service worker has no DOM
