@@ -775,25 +775,48 @@ if (typeof location !== 'undefined' &&
       } catch { return {}; }
     };
 
-    const isWorking = async (tabId, chat) => {
-      if (chat == null) return true;          // no active session → don't hide
-      if (tabId === chat) return true;
-      const m = await memb();
-      const g = m[chat];
-      return g != null && g !== NONE && m[tabId] === g; // same group as the chat tab
+    // Tabs we've switched to the idle placeholder — so we can restore them when
+    // the working session ends (otherwise the per-tab override would persist).
+    const idled = new Set();
+
+    const setPanel = async (tabId, panel) => {
+      try { await api.sidebarAction.setPanel({ tabId, panel }); } catch {}
     };
 
     const applyPanel = async (tabId) => {
       if (!api.sidebarAction || !api.sidebarAction.setPanel) return;
       const chat = await getChatTab();
       if (chat == null) return;               // nothing bound yet
-      const working = await isWorking(tabId, chat);
-      const panel = working ? `sidepanel.html?tabId=${chat}` : IDLE;
-      try { await api.sidebarAction.setPanel({ tabId, panel }); } catch {}
+      const m = await memb();
+      const g = m[chat];
+      // Only manage visibility while Claude has an ACTIVE working group. With no
+      // group (plain chat, or session ended), leave the global chat panel on every
+      // tab — don't show the idle placeholder.
+      if (g == null || g === NONE) return;
+      const working = (tabId === chat) || (m[tabId] === g);
+      if (working) { idled.delete(tabId); await setPanel(tabId, `sidepanel.html?tabId=${chat}`); }
+      else { idled.add(tabId); await setPanel(tabId, IDLE); }
+    };
+
+    const resetIdled = async () => {
+      for (const tabId of idled) await setPanel(tabId, 'sidepanel.html');
+      idled.clear();
     };
 
     if (api.tabs && api.tabs.onActivated) {
       api.tabs.onActivated.addListener((info) => { applyPanel(info.tabId); });
+    }
+    // Clear binding + restore placeholder tabs when the chat tab closes.
+    if (api.tabs && api.tabs.onRemoved) {
+      api.tabs.onRemoved.addListener(async (tabId) => {
+        const chat = await getChatTab();
+        idled.delete(tabId);
+        if (tabId === chat) {
+          window.__ffChatTabId = null;
+          try { await api.storage.session.remove('__ffChatTabId'); } catch {}
+          await resetIdled();
+        }
+      });
     }
   })();
 }
