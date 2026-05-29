@@ -992,6 +992,22 @@ if (!chrome.identity) {
   };
 }
 
+// ── chrome.dom (Chrome-only) → shadow-root access ────────────────────────────
+// The bundle's DOM/accessibility traversal uses chrome.dom.openOrClosedShadowRoot
+// to descend into shadow DOM. Firefox has no chrome.dom; map it to the open
+// shadow root (closed roots are inaccessible to extensions in Firefox and return
+// null, which the traversal tolerates).
+if (typeof chrome !== 'undefined' && !chrome.dom) {
+  chrome.dom = {
+    openOrClosedShadowRoot: (el) => {
+      try {
+        if (el && typeof el.openOrClosedShadowRoot === 'function') return el.openOrClosedShadowRoot();
+      } catch {}
+      return (el && el.shadowRoot) || null;
+    },
+  };
+}
+
 // ── chrome.action.getUserSettings (Chrome-only) ──────────────────────────────
 // Firefox exposes browser.action but not getUserSettings; the bundle awaits it.
 // Report the action as pinned so the bundle proceeds.

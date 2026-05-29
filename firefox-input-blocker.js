@@ -16,6 +16,19 @@
 // The "Stop Claude" button (injected by agent-visual-indicator) stays clickable
 // because we let events whose target is inside #claude-agent-stop-container pass.
 (function () {
+  // chrome.dom shim for the content-script (ISOLATED) world — the bundle's DOM
+  // traversal injected here uses chrome.dom.openOrClosedShadowRoot, absent in FF.
+  try {
+    if (typeof chrome !== 'undefined' && !chrome.dom) {
+      chrome.dom = {
+        openOrClosedShadowRoot: (el) => {
+          try { if (el && typeof el.openOrClosedShadowRoot === 'function') return el.openOrClosedShadowRoot(); } catch {}
+          return (el && el.shadowRoot) || null;
+        },
+      };
+    }
+  } catch {}
+
   if (window.__claudeZenInputBlockerInstalled) return;
   window.__claudeZenInputBlockerInstalled = true;
 
