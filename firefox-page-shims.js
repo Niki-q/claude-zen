@@ -424,6 +424,35 @@ if (typeof document !== 'undefined' &&
 if (!chrome.debugger) {
   const __ffApi = (typeof browser !== 'undefined' ? browser : chrome);
 
+  // CDP event fan-out. Firefox has no chrome.debugger.onEvent, so we synthesize
+  // events (Network.* from webRequest, Page.frameNavigated from webNavigation —
+  // see the background observer block below) and dispatch them to whatever
+  // registered onEvent listeners exist in THIS context. Background-origin events
+  // reach background listeners via window.__ffEmitCdp (local) and sidepanel
+  // listeners via a runtime broadcast (__FF_CDP_EVENT) mirrored here.
+  const __cdpListeners = new Set();
+  const __emitCdp = (source, method, params) => {
+    for (const l of __cdpListeners) { try { l(source, method, params); } catch {} }
+  };
+  if (typeof window !== 'undefined') window.__ffEmitCdp = __emitCdp;
+  if (__ffApi.runtime && __ffApi.runtime.onMessage) {
+    __ffApi.runtime.onMessage.addListener((m) => {
+      if (m && m.type === '__FF_CDP_EVENT') __emitCdp(m.source, m.method, m.params);
+    });
+  }
+  // Tracks which tabs asked for Network/Runtime events (mirrors the bundle's
+  // per-tab enable gating) so the background observers don't emit needlessly.
+  const __ffSetCdpFlag = async (kind, tabId, on) => {
+    if (tabId == null) return;
+    const key = kind === 'net' ? '__ffCdpNet' : '__ffCdpConsole';
+    try {
+      const o = await __ffApi.storage.session.get(key);
+      const map = (o && o[key]) || {};
+      if (on) map[tabId] = true; else delete map[tabId];
+      await __ffApi.storage.session.set({ [key]: map });
+    } catch {}
+  };
+
   // Runs `func(...args)` in the target tab's page (MAIN) world and returns its result.
   const __ffExec = async (tabId, func, args) => {
     if (!__ffApi.scripting || tabId == null) throw new Error('scripting unavailable');
@@ -506,10 +535,10 @@ if (!chrome.debugger) {
   const __ffSend = async (target, method, params = {}) => {
     const tabId = target && target.tabId;
     switch (method) {
-      case 'Runtime.enable':
+      case 'Network.enable':  __ffSetCdpFlag('net', tabId, true); return {};
+      case 'Network.disable': __ffSetCdpFlag('net', tabId, false); return {};
+      case 'Runtime.enable':  __ffSetCdpFlag('console', tabId, true); return {};
       case 'Page.enable':
-      case 'Network.enable':
-      case 'Network.disable':
       case 'DOM.enable':
       case 'Page.handleJavaScriptDialog':
         return {};
@@ -556,9 +585,93 @@ if (!chrome.debugger) {
       if (typeof cb === 'function') { p.then((r) => cb(r), () => cb(undefined)); return; }
       return p;
     },
-    onEvent:  { addListener: () => {}, removeListener: () => {}, hasListener: () => false },
+    onEvent: {
+      addListener: (fn) => __cdpListeners.add(fn),
+      removeListener: (fn) => __cdpListeners.delete(fn),
+      hasListener: (fn) => __cdpListeners.has(fn),
+    },
     onDetach: { addListener: () => {}, removeListener: () => {}, hasListener: () => false },
   };
+}
+
+// ── Background CDP event sources: webRequest → Network.*, webNavigation → Page.* ─
+// Synthesize the CDP events the bundle listens for. Runs in the background page
+// only (it owns webRequest/webNavigation). Network events are gated by the
+// per-tab enable flags the sendCommand shim records; frameNavigated is cheap and
+// ungated. Each event is emitted to local background listeners (window.__ffEmitCdp)
+// and broadcast for sidepanel listeners (__FF_CDP_EVENT).
+if (typeof location !== 'undefined' &&
+    location.pathname.endsWith('_generated_background_page.html')) {
+  (function () {
+    const api = (typeof browser !== 'undefined' ? browser : chrome);
+    const netTabs = new Set();
+
+    const refreshNet = async () => {
+      try {
+        const o = await api.storage.session.get('__ffCdpNet');
+        const map = (o && o.__ffCdpNet) || {};
+        netTabs.clear();
+        for (const k of Object.keys(map)) netTabs.add(Number(k));
+      } catch {}
+    };
+    refreshNet();
+    if (api.storage && api.storage.onChanged) {
+      api.storage.onChanged.addListener((changes, area) => {
+        if (area === 'session' && changes.__ffCdpNet) refreshNet();
+      });
+    }
+
+    const emit = (tabId, method, params) => {
+      if (tabId == null || tabId < 0) return;
+      const source = { tabId };
+      if (typeof window !== 'undefined' && typeof window.__ffEmitCdp === 'function') {
+        window.__ffEmitCdp(source, method, params);
+      }
+      try {
+        const p = api.runtime.sendMessage({ type: '__FF_CDP_EVENT', source, method, params });
+        if (p && p.catch) p.catch(() => {});
+      } catch {}
+    };
+
+    if (api.webRequest) {
+      const filter = { urls: ['<all_urls>'] };
+      api.webRequest.onBeforeRequest.addListener((d) => {
+        if (!netTabs.has(d.tabId)) return;
+        emit(d.tabId, 'Network.requestWillBeSent', {
+          requestId: String(d.requestId),
+          request: { url: d.url, method: d.method },
+          documentURL: d.documentUrl || d.originUrl || d.url,
+          type: d.type,
+          timestamp: (d.timeStamp || Date.now()) / 1000,
+        });
+      }, filter);
+      api.webRequest.onCompleted.addListener((d) => {
+        if (!netTabs.has(d.tabId)) return;
+        emit(d.tabId, 'Network.responseReceived', {
+          requestId: String(d.requestId),
+          response: { url: d.url, status: d.statusCode },
+          type: d.type,
+        });
+      }, filter);
+      api.webRequest.onErrorOccurred.addListener((d) => {
+        if (!netTabs.has(d.tabId)) return;
+        emit(d.tabId, 'Network.loadingFailed', {
+          requestId: String(d.requestId),
+          errorText: d.error,
+          type: d.type,
+        });
+      }, filter);
+    }
+
+    if (api.webNavigation && api.webNavigation.onCommitted) {
+      api.webNavigation.onCommitted.addListener((d) => {
+        if (d.frameId !== 0) return; // main frame only (bundle gates on !parentId)
+        emit(d.tabId, 'Page.frameNavigated', {
+          frame: { id: String(d.tabId), url: d.url },
+        });
+      });
+    }
+  })();
 }
 
 // ── chrome.sidePanel → browser.sidebarAction ──────────────────────────────────
@@ -849,6 +962,13 @@ if (!chrome.identity) {
     removeCachedAuthToken:     (_, cb) => { if (cb) cb();          return Promise.resolve(); },
     clearAllCachedAuthTokens:  (cb)    => { if (cb) cb();          return Promise.resolve(); },
   };
+}
+
+// ── chrome.action.getUserSettings (Chrome-only) ──────────────────────────────
+// Firefox exposes browser.action but not getUserSettings; the bundle awaits it.
+// Report the action as pinned so the bundle proceeds.
+if (chrome.action && typeof chrome.action.getUserSettings !== 'function') {
+  chrome.action.getUserSettings = async () => ({ isOnToolbar: true });
 }
 
 // ── Theme detection (replaces the CSP-blocked inline <script> in HTML pages) ──
