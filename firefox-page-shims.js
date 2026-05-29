@@ -448,6 +448,9 @@ if (typeof document !== 'undefined' &&
             url.searchParams.set('tabId', String(pick.id));
             try { history.replaceState({}, '', url); } catch (e) { console.warn(`${LOG} replaceState failed`, e); }
             console.log(`${LOG} active tabId resolved: ${pick.id}`);
+            // Put the main tab in a Claude group so newly created tabs can join it
+            // and pass the bundle's same-group access gate (see __ffEnsureMainGroup).
+            try { if (self.__ffEnsureMainGroup) await self.__ffEnsureMainGroup(pick.id); } catch {}
           } else {
             console.warn(`${LOG} could not resolve an active tab — bundle may show "No active tab"`);
           }
@@ -742,6 +745,24 @@ if (typeof document !== 'undefined' &&
       onRemoved: { addListener: () => {}, removeListener: () => {}, hasListener: () => false },
     };
   }
+
+  // Seed the session's main tab into a Claude group. The upstream bundle only ever
+  // groups the main tab through its MCP/session-group tools — for a plain "open a
+  // tab" flow it NEVER calls createGroup, so the main tab's groupId stays NONE,
+  // tabs_create's `if (mainTab.groupId !== NONE)` guard skips grouping the new tab,
+  // and the access gate rejects every new tab ("not in the same group"). By putting
+  // the main tab in a group here, get(mainTab).groupId becomes non-NONE → the bundle
+  // groups freshly created tabs into it → the gate's findGroupByTab reconstructs the
+  // group from chrome.tabs.query({groupId}) (our overlay) and access is granted.
+  // Idempotent; native group when the tab is groupable, emulated otherwise.
+  self.__ffEnsureMainGroup = async (tabId) => {
+    try {
+      if (tabId == null || !chrome.tabs) return;
+      const st = await getState();
+      if (st.memb[tabId] != null) return;   // already in a group
+      await groupFn({ tabIds: [tabId] });
+    } catch {}
+  };
 })();
 
 // ── chrome.debugger (absent in Firefox) → translate CDP to Firefox APIs ───────
