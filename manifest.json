@@ -62,7 +62,7 @@
    "options_page": "options.html",
    "permissions": [
       "storage", "activeTab", "scripting",
-      "tabs", "alarms", "notifications", "webNavigation",
+      "tabs", "tabGroups", "alarms", "notifications", "webNavigation",
       "declarativeNetRequest", "nativeMessaging",
       "unlimitedStorage", "downloads", "identity",
       "webRequest", "webRequestBlocking"

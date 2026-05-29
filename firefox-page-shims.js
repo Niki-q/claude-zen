@@ -69,7 +69,18 @@ if (typeof window !== 'undefined' && typeof window.fetch === 'function') {
       }
     } catch (e) { console.warn('[claude-zen] fetch header inject failed:', e?.message); }
 
+    // Debug mirror (opt-in): log the outgoing user turn / tool results.
+    const _czIsMessages = url.includes('api.anthropic.com') && url.includes('/messages');
+    if (_czIsMessages && self.__czDebug && self.__czDebug.enabled) {
+      try { self.__czDebug.logRequest(input, init); } catch {}
+    }
+
     const resp = await _origFetch.call(this, input, init);
+
+    // Debug mirror (opt-in): tee the SSE response → console (non-destructive).
+    if (_czIsMessages && self.__czDebug && self.__czDebug.enabled) {
+      try { self.__czDebug.tee(resp); } catch {}
+    }
     try {
       if (url.includes('api.anthropic.com') && (resp.status === 401 || resp.status === 403)) {
         const body = await resp.clone().text();
@@ -79,6 +90,171 @@ if (typeof window !== 'undefined' && typeof window.fetch === 'function') {
     return resp;
   };
 }
+
+// ── Debug mirror: tee the chat to the console ─────────────────────────────────
+// Optional dev aid. When enabled, mirrors everything that flows through the chat
+// to the console: outgoing user turns and tool results (from the request body),
+// and the assistant's text, thinking blocks, and tool_use calls WITH their args
+// (parsed from the streaming SSE response). This complements the bundle's own
+// "[Computer Tool]" logs (PermissionManager-*.js), which only cover tool execution.
+// Non-destructive: the response is read via resp.clone(), so the bundle still gets
+// the untouched original stream. Toggle from the sidepanel console (right-click the
+// sidebar → Inspect, or about:debugging → this Firefox → Inspect):
+//     czDebug()        // enable
+//     czDebug(false)   // disable
+// State persists in storage.local.__czDebugMirror and propagates across contexts.
+(function () {
+  const api = (typeof browser !== 'undefined' ? browser : chrome);
+  const store = (api && api.storage && api.storage.local) || null;
+  const FLAG = '__czDebugMirror';
+  let enabled = false;
+
+  const C = {
+    user:   'color:#2563eb;font-weight:bold',
+    text:   'color:#16a34a',
+    think:  'color:#9333ea;font-style:italic',
+    tool:   'color:#d97706;font-weight:bold',
+    result: 'color:#0891b2',
+    meta:   'color:#6b7280',
+  };
+  const trunc = (s, n = 4000) => {
+    s = (s == null) ? '' : String(s);
+    return s.length > n ? s.slice(0, n) + `… [+${s.length - n} chars]` : s;
+  };
+  const log = (kind, msg) => {
+    try { console.log(`%c[claude-zen][chat] ${msg}`, C[kind] || C.meta); } catch {}
+  };
+  const banner = () => log('meta', 'chat mirror enabled — thoughts, tool calls & results will print here');
+
+  // Parse the Anthropic SSE stream (a clone) and print each block once it completes.
+  async function parseStream(stream) {
+    const reader = stream.getReader();
+    const dec = new TextDecoder();
+    const blocks = {};
+    let buf = '';
+    try {
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buf += dec.decode(value, { stream: true });
+        let i;
+        while ((i = buf.indexOf('\n\n')) >= 0) {
+          handleEvent(buf.slice(0, i), blocks);
+          buf = buf.slice(i + 2);
+        }
+      }
+    } catch {}
+  }
+
+  function handleEvent(raw, blocks) {
+    let data = '';
+    for (const ln of raw.split('\n')) if (ln.startsWith('data:')) data += ln.slice(5).trim();
+    if (!data || data === '[DONE]') return;
+    let ev; try { ev = JSON.parse(data); } catch { return; }
+    switch (ev.type) {
+      case 'message_start':
+        log('meta', `▶ message start${ev.message && ev.message.model ? ' — ' + ev.message.model : ''}`);
+        break;
+      case 'content_block_start': {
+        const b = ev.content_block || {};
+        blocks[ev.index] = { type: b.type, text: '', json: '', name: b.name };
+        if (b.type === 'tool_use') log('tool', `🔧 tool call: ${b.name}`);
+        break;
+      }
+      case 'content_block_delta': {
+        const b = blocks[ev.index] || (blocks[ev.index] = { type: '', text: '', json: '' });
+        const d = ev.delta || {};
+        if (d.type === 'text_delta') b.text += d.text || '';
+        else if (d.type === 'thinking_delta') b.text += d.thinking || '';
+        else if (d.type === 'input_json_delta') b.json += d.partial_json || '';
+        break;
+      }
+      case 'content_block_stop': {
+        const b = blocks[ev.index]; if (!b) break;
+        if (b.type === 'thinking') log('think', `💭 thinking:\n${trunc(b.text)}`);
+        else if (b.type === 'text') log('text', `💬 assistant:\n${trunc(b.text)}`);
+        else if (b.type === 'tool_use') {
+          let input = b.json;
+          try { input = JSON.stringify(JSON.parse(b.json || '{}'), null, 2); } catch {}
+          log('tool', `🔧 ${b.name || 'tool'} args:\n${trunc(input)}`);
+        }
+        delete blocks[ev.index];
+        break;
+      }
+      case 'message_delta':
+        if (ev.delta && ev.delta.stop_reason)
+          log('meta', `■ stop: ${ev.delta.stop_reason}${ev.usage ? ' · usage ' + JSON.stringify(ev.usage) : ''}`);
+        break;
+      case 'message_stop':
+        log('meta', '■ message complete');
+        break;
+      case 'error':
+        log('meta', `⚠ error: ${trunc(JSON.stringify(ev.error || ev))}`);
+        break;
+    }
+  }
+
+  // Print the newest message in an outgoing request body (user input + tool results).
+  function printRequest(bodyStr) {
+    let obj; try { obj = JSON.parse(bodyStr); } catch { return; }
+    if (!obj || !Array.isArray(obj.messages) || !obj.messages.length) return;
+    const last = obj.messages[obj.messages.length - 1];
+    if (!last) return;
+    const role = last.role || 'user';
+    if (typeof last.content === 'string') { log('user', `👤 ${role}:\n${trunc(last.content)}`); return; }
+    if (!Array.isArray(last.content)) return;
+    for (const c of last.content) {
+      if (!c || !c.type) continue;
+      if (c.type === 'text') log('user', `👤 ${role}: ${trunc(c.text)}`);
+      else if (c.type === 'image') log('user', '👤 [image]');
+      else if (c.type === 'tool_result') {
+        let body = c.content;
+        if (Array.isArray(body))
+          body = body.map(x => x && x.type === 'text' ? x.text
+            : x && x.type === 'image' ? '[image]' : `[${(x && x.type) || '?'}]`).join('\n');
+        log('result', `✅ tool result${c.is_error ? ' [ERROR]' : ''}${c.tool_use_id ? ' (' + c.tool_use_id + ')' : ''}:\n${trunc(body)}`);
+      }
+    }
+  }
+
+  // Public hooks called by the window.fetch wrapper above.
+  self.__czDebug = {
+    get enabled() { return enabled; },
+    logRequest(input, init) {
+      try {
+        const body = init && init.body;
+        if (typeof body === 'string') { printRequest(body); return; }
+        // Request object: read a clone so the real body isn't consumed.
+        if (input && typeof input.clone === 'function') {
+          input.clone().text().then(printRequest).catch(() => {});
+        }
+      } catch {}
+    },
+    tee(resp) {
+      try {
+        const ct = (resp.headers && resp.headers.get('content-type')) || '';
+        if (!resp.body || !/event-stream/.test(ct)) return;
+        parseStream(resp.clone().body).catch(() => {});
+      } catch {}
+    },
+  };
+
+  // Console toggle: czDebug() → on, czDebug(false) → off.
+  self.czDebug = function (on) {
+    enabled = (on === undefined) ? true : !!on;
+    if (store) { try { store.set({ [FLAG]: enabled }); } catch {} }
+    log('meta', `mirror ${enabled ? 'ON' : 'OFF'}`);
+    return enabled;
+  };
+
+  // Load the persisted flag and react to toggles from other contexts.
+  if (store) { try { store.get(FLAG).then((o) => { if (o && o[FLAG]) { enabled = true; banner(); } }); } catch {} }
+  try {
+    api.storage.onChanged.addListener((ch, area) => {
+      if (area === 'local' && ch && ch[FLAG]) { enabled = !!ch[FLAG].newValue; if (enabled) banner(); }
+    });
+  } catch {}
+})();
 
 // ── chrome.tabs.query: Firefox sidebar workaround ─────────────────────────────
 // In Firefox sidebar context, tabs.query({active:true,currentWindow:true})
@@ -150,6 +326,38 @@ if (chrome.tabs && chrome.tabs.query) {
     return handle();
   };
 }
+
+// ── chrome.tabs.create / windows.create: Chrome new-tab URL → Firefox ─────────
+// The upstream bundle opens scratch tabs with url:"chrome://newtab" (Chrome's
+// new-tab page) in tabs_create, browser_batch's tabs_create, and the session-group
+// fallback paths. Firefox rejects that scheme — "Illegal URL: chrome://newtab" —
+// so every new-tab creation fails (observed: "open two tabs" could open only one).
+// chrome:// is privileged in Firefox; there is no settable equivalent of Chrome's
+// new-tab URL, so we drop the url entirely and let Firefox open its native new tab
+// (the bundle navigates it immediately afterwards anyway).
+(function () {
+  const NEWTAB = /^chrome:\/\/(newtab|new-tab-page)\/?$/i;
+  const fix = (o) => {
+    if (o && typeof o.url === 'string' && NEWTAB.test(o.url)) {
+      const c = { ...o };
+      delete c.url;
+      return c;
+    }
+    return o;
+  };
+  if (chrome.tabs && typeof chrome.tabs.create === 'function') {
+    const _create = chrome.tabs.create.bind(chrome.tabs);
+    chrome.tabs.create = function (opts, cb) {
+      return (typeof cb === 'function') ? _create(fix(opts), cb) : _create(fix(opts));
+    };
+  }
+  if (chrome.windows && typeof chrome.windows.create === 'function') {
+    const _wcreate = chrome.windows.create.bind(chrome.windows);
+    chrome.windows.create = function (opts, cb) {
+      return (typeof cb === 'function') ? _wcreate(fix(opts), cb) : _wcreate(fix(opts));
+    };
+  }
+})();
 
 // ── Firefox: inject ?tabId=N into sidepanel URL before bundle loads ──────────
 // Chrome's bundle reads tabId from `sidepanel.html?tabId=N` (URL param set by
@@ -259,21 +467,38 @@ if (typeof document !== 'undefined' &&
   })();
 }
 
-// ── Tab Groups emulation (Firefox has no chrome.tabGroups / tabs.group) ───────
+// ── Tab Groups (native on Firefox 139+, emulated on 128–138) ──────────────────
 // Chrome's bundle uses real OS tab groups to corral the tabs Claude drives, and
 // re-finds them on invoke via tabs.query({groupId}) / tab.groupId / tabGroups.*.
-// Firefox 128 has no grouping API, so without this the group is lost on every
-// invocation and Claude can't see "its" tabs. We emulate a LOGICAL group: a
-// registry kept in storage.session (shared across background + sidepanel,
-// survives SW unload, cleared on browser restart) mapping tabId→groupId plus
-// per-group metadata. There is no visual group in the Firefox UI, but every API
-// the bundle relies on behaves consistently, so the orchestration works.
+// It only ever acts on tabs whose groupId matches its own group (and bails when
+// tab.groupId === TAB_GROUP_ID_NONE), so the group IS the access boundary.
+//
+// Firefox 139+ implements chrome.tabGroups + chrome.tabs.group/ungroup natively;
+// when detected (see `nativeGroups` below) we leave those APIs alone so Claude's
+// tabs land in a REAL, visible OS group and the access gating works against it.
+//
+// Firefox 128–138 has no grouping API, so without a shim the group is lost on
+// every invocation and Claude can't see "its" tabs. As a fallback we emulate a
+// LOGICAL group: a registry in storage.session (shared across background +
+// sidepanel, survives SW unload, cleared on browser restart) mapping tabId→groupId
+// plus per-group metadata. There is no visual group in that fallback, but every API
+// the bundle relies on behaves consistently, so the orchestration still works.
 (function () {
   const api = (typeof browser !== 'undefined' ? browser : chrome);
   const store = api.storage && (api.storage.session || api.storage.local);
   const NONE = -1;
   const K_META = '__ffGroupMeta', K_MEMB = '__ffTabGroup', K_SEQ = '__ffGroupSeq';
   const isBackground = (typeof document === 'undefined');
+
+  // Firefox 139+ ships real tab groups: chrome.tabGroups + chrome.tabs.group/ungroup,
+  // with tabs.query({groupId}) and tab.groupId working natively. When present, defer
+  // to it so Claude's tabs land in a REAL, visible OS group and the bundle's
+  // group-based access gating (tab.groupId === TAB_GROUP_ID_NONE checks,
+  // tabs.query({groupId}) enumeration, cross-tab groupId equality) operates on actual
+  // browser groups. Only fall back to the logical storage-registry emulation below on
+  // older Firefox (128–138) that lacks the API.
+  const nativeGroups = (typeof chrome.tabGroups !== 'undefined' &&
+                        typeof chrome.tabGroups.TAB_GROUP_ID_NONE === 'number');
 
   const getState = async () => {
     if (!store) return { meta: {}, memb: {}, seq: 1000 };
@@ -315,7 +540,16 @@ if (typeof document !== 'undefined' &&
     return p;
   };
 
-  if (chrome.tabs) {
+  if (chrome.tabs && nativeGroups) {
+    // Native path (Firefox 139+): leave chrome.tabs.group/ungroup/query/get untouched
+    // so the real API drives visible groups. Firefox exposes these on `browser` and
+    // mirrors them onto `chrome`; alias from `browser` only if a `chrome.*` callable
+    // is somehow missing, so the Chrome bundle's `chrome.tabs.group(...)` still works.
+    if (typeof chrome.tabs.group !== 'function' && api.tabs.group)
+      chrome.tabs.group = (...a) => api.tabs.group(...a);
+    if (typeof chrome.tabs.ungroup !== 'function' && api.tabs.ungroup)
+      chrome.tabs.ungroup = (...a) => api.tabs.ungroup(...a);
+  } else if (chrome.tabs) {
     chrome.tabs.group   = dual(groupFn, () => NONE);
     chrome.tabs.ungroup = dual(ungroupFn);
 
