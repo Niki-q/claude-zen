@@ -1041,6 +1041,19 @@ if (!chrome.sidePanel) {
   chrome.sidePanel = {
     setOptions: async (opts) => {
       try {
+        // Claude calls setOptions to bind the panel to a tab right as a conversation
+        // starts / a new chat opens. That is the reliable "a thread begins here" signal,
+        // so seed the group now — guarantees the conversation's INITIAL tab is in a
+        // Claude group (and thus shows up as a switchable thread) instead of being left
+        // out when the bundle groups later scratch tabs. Idempotent (see __ffEnsureMainGroup).
+        try {
+          let tid = (opts && opts.tabId != null) ? Number(opts.tabId) : null;
+          if (tid == null && opts && opts.path) {
+            const m = /[?&]tabId=(\d+)/.exec(opts.path);
+            if (m) tid = Number(m[1]);
+          }
+          if (tid != null && self.__ffEnsureMainGroup) await self.__ffEnsureMainGroup(tid);
+        } catch {}
         if (opts && opts.path && browser.sidebarAction && browser.sidebarAction.setPanel) {
           // IMPORTANT: set a GLOBAL panel (no tabId), unlike Chrome's per-tab
           // sidepanel model. Firefox has a single sidebar shared across tabs; if

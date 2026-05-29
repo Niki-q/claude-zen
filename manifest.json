@@ -3,7 +3,7 @@
       "default_title": "Open Claude"
    },
    "background": {
-      "scripts": ["firefox-page-shims.js", "gif.js", "offscreen.js", "firefox-bg-loader.js"]
+      "scripts": ["firefox-page-shims.js", "firefox-threads.js", "gif.js", "offscreen.js", "firefox-bg-loader.js"]
    },
    "browser_specific_settings": {
       "gecko": {

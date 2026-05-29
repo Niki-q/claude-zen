@@ -361,6 +361,47 @@ If the manifest and shims are still compatible with Chrome MV3:
 - **`git-hash.txt`**: Commit SHA of the original Chrome extension source (for provenance)
 - **`refactor-plan` (Russian)**: Original planning document describing the Chrome→Firefox porting strategy
 
+## Thread Switcher (sidebar) + Jump-to-Thread
+
+Chrome's side panel is per-tab, so switching tab groups swaps the sidebar to that
+session's conversation automatically. Firefox's sidebar is a **single global instance**
+pinned to one `?tabId=N` (resolved once by the `firefox-page-shims.js` sidepanel loader),
+so with multiple Claude sessions open there is no native way to switch which conversation
+the sidebar shows. A **"thread" = one Claude group** in the registry
+(`__ffGroupMeta`/`__ffTabGroup`), addressed by its **main tab**.
+
+**`firefox-threads.js`** (new; loaded in `background.scripts` *and* via a `<script>` tag in
+`sidepanel.html`) implements:
+- **Thread model** — reads the group registry directly from `storage.session` and exposes
+  `self.__ffGetThreads()` / `self.__ffThreadForTab(tabId)`, returning
+  `{groupId, mainTabId, windowId, native, tabIds, memberCount, title, host, url}`. The
+  `mainTabId` is persisted on group meta by `firefox-page-shims.js` at group-creation
+  time (`emulatedGroup`, the native branch of `groupFn`, and `__ffEnsureMainGroup`).
+- **Sidebar switcher (sidepanel only)** — a floating dropdown "pill" at the top of the
+  sidebar (shown only when ≥2 threads). Selecting a thread **repoints the sidebar only**:
+  it sets `?tabId=<mainTabId>` and `location.replace()`s, re-running the deferred-module
+  loader for that thread (browser tabs are left untouched). Each row has a **⤴ "jump to
+  tab"** button that focuses that thread's browser tab. Refreshes on `storage.onChanged`.
+- **Background handlers** (`runtime.onMessage`, `FF_*`): `FF_THREAD_MEMBERSHIP` (is this
+  tab in a Claude group?), `FF_FOCUS_TAB` (`tabs.update`+`windows.update`), and
+  `FF_JUMP_TO_THREAD` (resolve the tab's thread → broadcast `FF_SWITCH_THREAD` so the open
+  sidebar repoints; uses `sidebarAction.isOpen()` to tell the page whether it landed).
+- **Content-script registration** — registers `firefox-thread-jump.js` dynamically via
+  `scripting.registerContentScripts` (id `cz-thread-jump`), so no manifest
+  `content_scripts` edit is needed.
+
+**`firefox-thread-jump.js`** (new content script, `<all_urls>`, top frame, `document_idle`):
+on Claude-driven pages it shows a floating **"◆ Open in Claude"** button that repoints the
+open sidebar to that page's thread. **Gesture limitation:** Firefox can't open a *closed*
+sidebar without a live user gesture (lost across the message hop, and content scripts can't
+call `sidebarAction`), so when the sidebar is closed the button only toasts a hint
+("Open the Claude sidebar (Ctrl+E)…"). Membership lives in `storage.session` (unreadable
+from content scripts), so the button asks the background via `FF_THREAD_MEMBERSHIP`.
+
+Both new files are classic scripts, `[claude-zen][threads]`-prefixed, added to the
+`update-from-store.ps1` **protected** list, and the sidepanel `<script>` injection is
+replicated there so updates keep loading `firefox-threads.js`.
+
 ## Future Enhancements
 
 - **Visual tab groups**: ✅ Done — real native groups appear on **FF 138+** (gated on `canGroup`/`tabs.group`), with the orange "Claude" title/color added on **FF 139+** (gated on `nativeGroups`/the `tabGroups` namespace). The registry emulation remains only as a true fallback for privileged-only sessions or FF ≤137.
