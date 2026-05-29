@@ -966,11 +966,39 @@ if (!chrome.debugger) {
       altKey: !!(m & 1), ctrlKey: !!(m & 2), metaKey: !!(m & 4), shiftKey: !!(m & 8),
       button, buttons: p.buttons || 0, detail: p.clickCount || 1,
     };
-    const fire = (t) => el.dispatchEvent(new MouseEvent(t, base));
+    const fireM = (t, ev) => el.dispatchEvent(new MouseEvent(t, ev || base));
+    // Pointer Events: modern UI frameworks (React, Radix, Headless UI, etc.) gate
+    // buttons/menus on pointerdown/pointerup, NOT mousedown — firing only mouse
+    // events left those controls unresponsive to the agent (clicks "did nothing",
+    // and it looped re-screenshotting). Fire the pointer pair alongside the mouse
+    // pair. PointerEvent may be unavailable in odd contexts, so guard it.
+    const fireP = (t, pressure) => {
+      if (typeof PointerEvent !== 'function') return;
+      try {
+        el.dispatchEvent(new PointerEvent(t, {
+          ...base, pointerId: 1, pointerType: 'mouse', isPrimary: true,
+          width: 1, height: 1, pressure: pressure || 0,
+        }));
+      } catch {}
+    };
     switch (p.type) {
-      case 'mouseMoved': fire('mousemove'); break;
-      case 'mousePressed': if (el.focus) try { el.focus(); } catch {} fire('mousedown'); break;
-      case 'mouseReleased': fire('mouseup'); fire('click'); break;
+      case 'mouseMoved':
+        fireP('pointermove'); fireM('mousemove');
+        break;
+      case 'mousePressed':
+        // hover first so :hover / pointer-enter handlers settle before the press
+        fireP('pointerover');  fireM('mouseover');
+        fireP('pointerdown', 0.5); fireM('mousedown');
+        if (el.focus) { try { el.focus(); } catch {} }
+        break;
+      case 'mouseReleased':
+        fireP('pointerup'); fireM('mouseup');
+        if (button === 2) fireM('contextmenu');
+        else {
+          fireM('click');
+          if ((p.clickCount || 1) >= 2) fireM('dblclick');
+        }
+        break;
       case 'mouseWheel':
         el.dispatchEvent(new WheelEvent('wheel', { ...base, deltaX: p.deltaX || 0, deltaY: p.deltaY || 0 }));
         break;
@@ -982,12 +1010,18 @@ if (!chrome.debugger) {
     const el = document.activeElement || document.body;
     const m = p.modifiers || 0;
     const type = p.type === 'keyUp' ? 'keyup' : 'keydown';
-    el.dispatchEvent(new KeyboardEvent(type, {
+    const initKey = {
       bubbles: true, cancelable: true, composed: true, view: window,
       key: p.key || '', code: p.code || '',
       keyCode: p.windowsVirtualKeyCode || 0, which: p.windowsVirtualKeyCode || 0,
       altKey: !!(m & 1), ctrlKey: !!(m & 2), metaKey: !!(m & 4), shiftKey: !!(m & 8),
-    }));
+    };
+    el.dispatchEvent(new KeyboardEvent(type, initKey));
+    // Fire keypress for printable single chars on keydown — some (older / custom)
+    // handlers still listen on keypress rather than keydown.
+    if (type === 'keydown' && (p.key || '').length === 1 && !initKey.ctrlKey && !initKey.metaKey) {
+      el.dispatchEvent(new KeyboardEvent('keypress', initKey));
+    }
     // Backspace/Delete in editable targets have no default action for synthetic
     // events — emulate the edit so the bundle's key-based deletes still work.
     if (type === 'keydown' && el.isContentEditable) {
