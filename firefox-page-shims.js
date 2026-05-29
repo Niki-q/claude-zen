@@ -537,7 +537,10 @@ if (!chrome.debugger) {
     switch (method) {
       case 'Network.enable':  __ffSetCdpFlag('net', tabId, true); return {};
       case 'Network.disable': __ffSetCdpFlag('net', tabId, false); return {};
-      case 'Runtime.enable':  __ffSetCdpFlag('console', tabId, true); return {};
+      case 'Runtime.enable':
+        __ffSetCdpFlag('console', tabId, true);
+        try { const tp = __ffApi.tabs.sendMessage(tabId, { type: '__FF_CONSOLE_TRACK', on: true }); if (tp && tp.catch) tp.catch(() => {}); } catch {}
+        return {};
       case 'Page.enable':
       case 'DOM.enable':
       case 'Page.handleJavaScriptDialog':
@@ -669,6 +672,31 @@ if (typeof location !== 'undefined' &&
         emit(d.tabId, 'Page.frameNavigated', {
           frame: { id: String(d.tabId), url: d.url },
         });
+      });
+    }
+
+    // Console/exception entries relayed from the page (firefox-console-hook +
+    // -relay) → synthetic Runtime.consoleAPICalled / Runtime.exceptionThrown.
+    if (api.runtime && api.runtime.onMessage) {
+      api.runtime.onMessage.addListener((msg, sender) => {
+        if (!msg || msg.type !== '__FF_CDP_CONSOLE' || !sender || !sender.tab) return;
+        const tabId = sender.tab.id;
+        const p = msg.payload || {};
+        if (p.kind === 'exception') {
+          emit(tabId, 'Runtime.exceptionThrown', {
+            timestamp: p.ts,
+            exceptionDetails: {
+              text: p.message, exception: { description: p.message },
+              url: p.url, lineNumber: p.line, columnNumber: p.col,
+            },
+          });
+        } else {
+          emit(tabId, 'Runtime.consoleAPICalled', {
+            type: p.level || 'log',
+            args: (p.args || []).map((v) => ({ type: 'string', value: v })),
+            timestamp: p.ts,
+          });
+        }
       });
     }
   })();
