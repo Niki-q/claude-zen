@@ -510,6 +510,8 @@ if (typeof document !== 'undefined' &&
   const _natUngroup = (api.tabs && typeof api.tabs.ungroup === 'function') ? api.tabs.ungroup.bind(api.tabs) : null;
   const _natGet     = chrome.tabs ? chrome.tabs.get.bind(chrome.tabs)      : null;
   const _natQuery   = chrome.tabs ? chrome.tabs.query.bind(chrome.tabs)    : null;
+  const _natTgGet    = (chrome.tabGroups && chrome.tabGroups.get)    ? chrome.tabGroups.get.bind(chrome.tabGroups)    : null;
+  const _natTgUpdate = (chrome.tabGroups && chrome.tabGroups.update) ? chrome.tabGroups.update.bind(chrome.tabGroups) : null;
 
   // Tabs showing these schemes cannot be placed in a native Firefox tab group.
   const PRIVILEGED = /^(moz-extension|chrome-extension|about|chrome|view-source|data|resource|file):/i;
@@ -744,6 +746,42 @@ if (typeof document !== 'undefined' &&
       onMoved:   { addListener: () => {}, removeListener: () => {}, hasListener: () => false },
       onRemoved: { addListener: () => {}, removeListener: () => {}, hasListener: () => false },
     };
+  }
+
+  // Make Claude's groups VISIBLE as real Firefox tab groups. The registry stays the
+  // membership source of truth (so the access gate is unaffected); this only mirrors
+  // groupable members into a native group for the user to see. New tabs are privileged
+  // at creation (about:newtab) and can't be natively grouped until they navigate to a
+  // real URL — so we promote them on navigation. Promotions are serialized so several
+  // tabs navigating at once (e.g. browser_batch) land in ONE native group, not many.
+  if (isBackground && nativeGroups && _natGroup && api.tabs && api.tabs.onUpdated) {
+    const VISUAL_TITLE = 'Claude';
+    const promote = async (tabId) => {
+      const st = await getState();
+      const gid = st.memb[tabId];
+      if (gid == null || !st.meta[gid]) return;        // not a Claude-managed tab
+      if (!(await isGroupable(tabId))) return;          // still privileged (e.g. about:newtab)
+      // Where should it go? A native-backed group is its own visible group; an
+      // emulated group gets a lazily-created sibling native group (visualGroupId).
+      let target = st.meta[gid].native ? gid : st.meta[gid].visualGroupId;
+      if (target != null && _natTgGet) { try { await _natTgGet(target); } catch { target = null; } }
+      let cur; try { cur = await _natGet(tabId); } catch { return; }
+      if (cur && typeof cur.groupId === 'number' && cur.groupId === target) return; // already there
+      if (target != null) {
+        await _natGroup({ tabIds: [tabId], groupId: target });
+      } else {
+        const ngid = await _natGroup({ tabIds: [tabId] });
+        if (_natTgUpdate) { try { await _natTgUpdate(ngid, { title: VISUAL_TITLE, color: 'orange' }); } catch {} }
+        const fresh = await getState();
+        if (fresh.meta[gid]) { fresh.meta[gid].visualGroupId = ngid; await save({ [K_META]: fresh.meta }); }
+      }
+    };
+    let chain = Promise.resolve();
+    api.tabs.onUpdated.addListener((tabId, info) => {
+      if (info && (info.status === 'complete' || typeof info.url === 'string')) {
+        chain = chain.then(() => promote(tabId)).catch(() => {});
+      }
+    });
   }
 
   // Seed the session's main tab into a Claude group. The upstream bundle only ever
