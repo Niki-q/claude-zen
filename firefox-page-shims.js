@@ -870,8 +870,8 @@ if (typeof document !== 'undefined' &&
       // about:newtab / a new-tab override) that Firefox refuses to put in a VISIBLE
       // tab group — so it shows as "groupless" while the agent's scratch tabs (which
       // navigate to real URLs) form the visible group. On explicit chat init / new
-      // thread (makeGroupable), send that tab to a real, groupable Claude page first
-      // so it can visibly join the group. Real pages are left untouched.
+      // thread (makeGroupable), send that tab to a real, groupable page first so it
+      // can visibly join the group. Real pages are left untouched.
       if (opts.makeGroupable) {
         try {
           const t = await _natGet(tabId);
@@ -1067,10 +1067,9 @@ if (!chrome.sidePanel) {
     setOptions: async (opts) => {
       try {
         // Claude calls setOptions to bind the panel to a tab right as a conversation
-        // starts / a new chat opens. That is the reliable "a thread begins here" signal,
-        // so seed the group now — guarantees the conversation's INITIAL tab is in a
-        // Claude group (and thus shows up as a switchable thread) instead of being left
-        // out when the bundle groups later scratch tabs. Idempotent (see __ffEnsureMainGroup).
+        // starts / a new chat opens — the reliable "a thread begins here" signal. Seed
+        // the group now so the conversation's INITIAL tab is always in a Claude group
+        // (and a switchable thread), and make it groupable if it's a privileged page.
         try {
           let tid = (opts && opts.tabId != null) ? Number(opts.tabId) : null;
           if (tid == null && opts && opts.path) {
