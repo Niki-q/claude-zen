@@ -1088,7 +1088,18 @@ if (!chrome.sidePanel) {
           // across tab switches, so the document is kept alive and state persists.
           // The target tabId still reaches the bundle via the deferred-module
           // loader (history.replaceState ?tabId=N + URLSearchParams.get patch).
-          await browser.sidebarAction.setPanel({ panel: opts.path });
+          //
+          // BUG FIX: opts.path is `sidepanel.html?tabId=N`. Passing it verbatim set a
+          // per-tab-id GLOBAL panel URL, contradicting the note above — on the next tab
+          // switch Firefox saw a different default panel URL and RELOADED the sidebar,
+          // wiping the in-progress conversation (the "session not saved across tabs"
+          // bug). Strip ?tabId so the global panel URL stays constant; the loader
+          // re-injects the correct tabId per document load.
+          const globalPanel = String(opts.path)
+            .replace(/[?&]tabId=\d+/g, '')
+            .replace(/\?&/, '?')
+            .replace(/[?&]$/, '');
+          await browser.sidebarAction.setPanel({ panel: globalPanel });
         }
       } catch {}
     },
