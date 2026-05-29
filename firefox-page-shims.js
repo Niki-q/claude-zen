@@ -573,17 +573,25 @@ if (!chrome.sidePanel) {
   chrome.sidePanel = {
     setOptions: async (opts) => {
       try {
+        // Remember the chat/main tab the sidebar is bound to. The tabs.onActivated
+        // handler (below) uses it to keep showing the chat across all of Claude's
+        // working-group tabs, and to swap to the idle placeholder on other tabs.
+        let chatTab = (opts && opts.tabId != null) ? Number(opts.tabId) : null;
+        if (chatTab == null && opts && opts.path) {
+          const m = /[?&]tabId=(\d+)/.exec(opts.path);
+          if (m) chatTab = Number(m[1]);
+        }
+        if (chatTab != null) {
+          window.__ffChatTabId = chatTab;
+          try { await browser.storage.session.set({ __ffChatTabId: chatTab }); } catch {}
+        }
         if (opts && opts.path && browser.sidebarAction && browser.sidebarAction.setPanel) {
-          // IMPORTANT: set a GLOBAL panel (no tabId), unlike Chrome's per-tab
-          // sidepanel model. Firefox has a single sidebar shared across tabs; if
-          // we bind the panel to one tabId, switching to any other tab makes
-          // Firefox fall back to the default panel URL (no ?tabId) and RELOAD the
-          // sidebar document — re-initializing the whole bundle and wiping the
-          // in-progress conversation. A single global panel URL stays constant
-          // across tab switches, so the document is kept alive and state persists.
-          // The target tabId still reaches the bundle via the deferred-module
-          // loader (history.replaceState ?tabId=N + URLSearchParams.get patch).
+          // Global default panel (covers initial open + the active main tab).
           await browser.sidebarAction.setPanel({ panel: opts.path });
+          // Bind the chat tab explicitly so returning to it always shows the chat.
+          if (chatTab != null) {
+            try { await browser.sidebarAction.setPanel({ tabId: chatTab, panel: opts.path }); } catch {}
+          }
         }
       } catch {}
     },
@@ -592,6 +600,61 @@ if (!chrome.sidePanel) {
     getOptions:       async () => ({ enabled: true, path: 'sidepanel.html' }),
     setPanelBehavior: async () => {},
   };
+}
+
+// ── Per-tab sidebar visibility: chat on Claude's working tabs, idle elsewhere ──
+// Firefox has one global sidebar. We want the chat to appear only on Claude's
+// working-group tabs and an idle placeholder on every other tab, while the agent
+// keeps running in the background. Firefox lets us swap the per-tab panel freely
+// (sidebarAction.setPanel({tabId})), but NOT reopen the sidebar programmatically
+// (open() needs a user gesture) — so we never close it, we just swap content.
+// Runs in the background page only (it owns tab events). Working tabs all share
+// the SAME chat URL (?tabId=<chatTab>) so switching among them doesn't reload;
+// crossing into/out of the group swaps URL and reloads (chat history persists).
+if (typeof location !== 'undefined' &&
+    location.pathname.endsWith('_generated_background_page.html')) {
+  (function () {
+    const api = (typeof browser !== 'undefined' ? browser : chrome);
+    const IDLE = 'firefox-idle-panel.html';
+    const NONE = -1;
+
+    const getChatTab = async () => {
+      if (window.__ffChatTabId != null) return window.__ffChatTabId;
+      try {
+        const o = await api.storage.session.get('__ffChatTabId');
+        window.__ffChatTabId = (o && o.__ffChatTabId != null) ? o.__ffChatTabId : null;
+      } catch {}
+      return window.__ffChatTabId;
+    };
+
+    const memb = async () => {
+      try {
+        const o = await api.storage.session.get('__ffTabGroup');
+        return (o && o.__ffTabGroup) || {};
+      } catch { return {}; }
+    };
+
+    const isWorking = async (tabId, chat) => {
+      if (chat == null) return true;          // no active session → don't hide
+      if (tabId === chat) return true;
+      const m = await memb();
+      const g = m[chat];
+      return g != null && g !== NONE && m[tabId] === g; // same group as the chat tab
+    };
+
+    const applyPanel = async (tabId) => {
+      if (!api.sidebarAction || !api.sidebarAction.setPanel) return;
+      const chat = await getChatTab();
+      if (chat == null) return;               // nothing bound yet
+      const working = await isWorking(tabId, chat);
+      const panel = working ? `sidepanel.html?tabId=${chat}` : IDLE;
+      try { await api.sidebarAction.setPanel({ tabId, panel }); } catch {}
+    };
+
+    if (api.tabs && api.tabs.onActivated) {
+      api.tabs.onActivated.addListener((info) => { applyPanel(info.tabId); });
+    }
+  })();
 }
 
 // ── chrome.offscreen → handled inline in the Firefox background page ───────────
