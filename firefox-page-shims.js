@@ -467,22 +467,29 @@ if (typeof document !== 'undefined' &&
   })();
 }
 
-// ── Tab Groups (native on Firefox 139+, emulated on 128–138) ──────────────────
+// ── Tab Groups (HYBRID: native on FF 139+, storage-emulation fallback) ────────
 // Chrome's bundle uses real OS tab groups to corral the tabs Claude drives, and
 // re-finds them on invoke via tabs.query({groupId}) / tab.groupId / tabGroups.*.
-// It only ever acts on tabs whose groupId matches its own group (and bails when
+// It only ever acts on tabs whose group matches the session's group (bailing when
 // tab.groupId === TAB_GROUP_ID_NONE), so the group IS the access boundary.
 //
-// Firefox 139+ implements chrome.tabGroups + chrome.tabs.group/ungroup natively;
-// when detected (see `nativeGroups` below) we leave those APIs alone so Claude's
-// tabs land in a REAL, visible OS group and the access gating works against it.
+// The hard problem on Firefox: native chrome.tabs.group (FF 139+) REFUSES to group
+// privileged/extension pages (moz-extension://, about:*, chrome://). Claude's "main
+// tab" is very often exactly that (e.g. a new-tab-page override), and freshly
+// created scratch tabs open at about:newtab. If we used the native API blindly,
+// createGroup(mainTab) throws → no group is ever created → every new tab is "not in
+// the same group" and the agent can't control it (and "No group found for main tab").
 //
-// Firefox 128–138 has no grouping API, so without a shim the group is lost on
-// every invocation and Claude can't see "its" tabs. As a fallback we emulate a
-// LOGICAL group: a registry in storage.session (shared across background +
-// sidepanel, survives SW unload, cleared on browser restart) mapping tabId→groupId
-// plus per-group metadata. There is no visual group in that fallback, but every API
-// the bundle relies on behaves consistently, so the orchestration still works.
+// So we run a HYBRID with the storage registry as the unified source of truth for
+// membership:
+//   • groupable web tab  → create a REAL, visible native group; mirror it in the
+//                          registry (native:true) so queries stay consistent.
+//   • privileged tab / native rejection / FF ≤138 → emulate a LOGICAL group with a
+//                          negative id (never collides with native +ve ids or NONE).
+// chrome.tabs.get/query are overlaid so a tab's groupId comes from the registry when
+// Claude manages it, else from the native value — so both real and emulated groups,
+// plus user-made native groups, all report consistently. The registry lives in
+// storage.session (shared bg+sidepanel, survives SW unload, cleared on restart).
 (function () {
   const api = (typeof browser !== 'undefined' ? browser : chrome);
   const store = api.storage && (api.storage.session || api.storage.local);
@@ -490,46 +497,102 @@ if (typeof document !== 'undefined' &&
   const K_META = '__ffGroupMeta', K_MEMB = '__ffTabGroup', K_SEQ = '__ffGroupSeq';
   const isBackground = (typeof document === 'undefined');
 
-  // Firefox 139+ ships real tab groups: chrome.tabGroups + chrome.tabs.group/ungroup,
-  // with tabs.query({groupId}) and tab.groupId working natively. When present, defer
-  // to it so Claude's tabs land in a REAL, visible OS group and the bundle's
-  // group-based access gating (tab.groupId === TAB_GROUP_ID_NONE checks,
-  // tabs.query({groupId}) enumeration, cross-tab groupId equality) operates on actual
-  // browser groups. Only fall back to the logical storage-registry emulation below on
-  // older Firefox (128–138) that lacks the API.
+  // FF 139+ exposes chrome.tabGroups + chrome.tabs.group natively.
   const nativeGroups = (typeof chrome.tabGroups !== 'undefined' &&
                         typeof chrome.tabGroups.TAB_GROUP_ID_NONE === 'number');
 
+  // Capture natives BEFORE we override anything. group/ungroup come from `browser`
+  // (Promise-based); get/query are the already-installed sidebar-aware wrappers.
+  const _natGroup   = (api.tabs && typeof api.tabs.group === 'function')   ? api.tabs.group.bind(api.tabs)   : null;
+  const _natUngroup = (api.tabs && typeof api.tabs.ungroup === 'function') ? api.tabs.ungroup.bind(api.tabs) : null;
+  const _natGet     = chrome.tabs ? chrome.tabs.get.bind(chrome.tabs)      : null;
+  const _natQuery   = chrome.tabs ? chrome.tabs.query.bind(chrome.tabs)    : null;
+
+  // Tabs showing these schemes cannot be placed in a native Firefox tab group.
+  const PRIVILEGED = /^(moz-extension|chrome-extension|about|chrome|view-source|data|resource|file):/i;
+  const isGroupable = async (id) => {
+    if (!nativeGroups || !_natGet) return false;
+    try { const t = await _natGet(id); const u = t && t.url; return !!u && !PRIVILEGED.test(u); }
+    catch { return false; }
+  };
+
   const getState = async () => {
-    if (!store) return { meta: {}, memb: {}, seq: 1000 };
+    if (!store) return { meta: {}, memb: {}, seq: 0 };
     const o = await store.get([K_META, K_MEMB, K_SEQ]);
-    return { meta: o[K_META] || {}, memb: o[K_MEMB] || {}, seq: o[K_SEQ] || 1000 };
+    return { meta: o[K_META] || {}, memb: o[K_MEMB] || {}, seq: o[K_SEQ] || 0 };
   };
   const save = async (obj) => { if (store) await store.set(obj); };
   const toIds = (x) => (Array.isArray(x) ? x : (x != null ? [x] : [])).map(Number);
 
-  const groupFn = async (opts = {}) => {
+  // Emulated (logical) group — negative ids so they never collide with native.
+  const emulatedGroup = async (opts = {}) => {
     const ids = toIds(opts.tabIds);
     const st = await getState();
     let gid = opts.groupId;
-    if (gid == null) {
-      gid = st.seq + 1; st.seq = gid;
+    if (gid == null || !st.meta[gid]) {
+      if (gid == null) {
+        gid = (typeof st.seq === 'number' && st.seq <= -1000 ? st.seq : -999) - 1;
+        st.seq = gid;
+      }
       let windowId;
-      try { windowId = (await api.tabs.get(ids[0])).windowId; } catch {}
-      st.meta[gid] = { id: gid, title: '', color: 'grey', collapsed: false, windowId };
-    } else if (!st.meta[gid]) {
-      st.meta[gid] = { id: gid, title: '', color: 'grey', collapsed: false };
+      try { windowId = (await _natGet(ids[0])).windowId; } catch {}
+      st.meta[gid] = { id: gid, title: '', color: 'grey', collapsed: false, windowId, native: false };
     }
     for (const id of ids) st.memb[id] = gid;
     await save({ [K_META]: st.meta, [K_MEMB]: st.memb, [K_SEQ]: st.seq });
     return gid;
   };
 
+  const groupFn = async (opts = {}) => {
+    const ids = toIds(opts.tabIds);
+    const st = await getState();
+    const gid = opts.groupId;
+
+    // Adding to a group Claude already tracks (native-backed or emulated).
+    if (gid != null && st.meta[gid]) {
+      if (st.meta[gid].native && _natGroup) {
+        const ok = [];
+        for (const id of ids) if (await isGroupable(id)) ok.push(id);
+        if (ok.length) { try { await _natGroup({ tabIds: ok, groupId: gid }); } catch {} }
+      }
+      for (const id of ids) st.memb[id] = gid;
+      await save({ [K_MEMB]: st.memb });
+      return gid;
+    }
+
+    // New group from groupable tabs → real native group, mirrored into the registry.
+    if (gid == null && nativeGroups && _natGroup) {
+      let allOk = ids.length > 0;
+      for (const id of ids) if (!(await isGroupable(id))) { allOk = false; break; }
+      if (allOk) {
+        try {
+          const ngid = await _natGroup(opts);
+          let windowId;
+          try { windowId = (await _natGet(ids[0])).windowId; } catch {}
+          const fresh = await getState();
+          fresh.meta[ngid] = { id: ngid, title: '', color: 'grey', collapsed: false, windowId, native: true };
+          for (const id of ids) fresh.memb[id] = ngid;
+          await save({ [K_META]: fresh.meta, [K_MEMB]: fresh.memb });
+          return ngid;
+        } catch {}
+      }
+    }
+
+    // Fallback: privileged tabs, native rejection, or FF ≤138 → emulate.
+    return emulatedGroup(opts);
+  };
+
   const ungroupFn = async (tabIds) => {
     const ids = toIds(tabIds);
     const st = await getState();
-    for (const id of ids) delete st.memb[id];
+    const nativeIds = [];
+    for (const id of ids) {
+      const gid = st.memb[id];
+      if (gid != null && st.meta[gid] && st.meta[gid].native) nativeIds.push(id);
+      delete st.memb[id];
+    }
     await save({ [K_MEMB]: st.memb });
+    if (nativeIds.length && _natUngroup) { try { await _natUngroup(nativeIds); } catch {} }
   };
 
   // Promise/callback adapter matching the WebExtension dual signature.
@@ -540,32 +603,26 @@ if (typeof document !== 'undefined' &&
     return p;
   };
 
-  if (chrome.tabs && nativeGroups) {
-    // Native path (Firefox 139+): leave chrome.tabs.group/ungroup/query/get untouched
-    // so the real API drives visible groups. Firefox exposes these on `browser` and
-    // mirrors them onto `chrome`; alias from `browser` only if a `chrome.*` callable
-    // is somehow missing, so the Chrome bundle's `chrome.tabs.group(...)` still works.
-    if (typeof chrome.tabs.group !== 'function' && api.tabs.group)
-      chrome.tabs.group = (...a) => api.tabs.group(...a);
-    if (typeof chrome.tabs.ungroup !== 'function' && api.tabs.ungroup)
-      chrome.tabs.ungroup = (...a) => api.tabs.ungroup(...a);
-  } else if (chrome.tabs) {
+  if (chrome.tabs) {
     chrome.tabs.group   = dual(groupFn, () => NONE);
     chrome.tabs.ungroup = dual(ungroupFn);
 
-    // Wrap query: strip the FF-unsupported groupId filter, annotate each tab's
-    // groupId from the registry, and apply groupId filtering ourselves.
-    const _q = chrome.tabs.query.bind(chrome.tabs);
+    // Overlay query: registry membership wins; otherwise keep the native groupId.
+    // groupId filtering is applied here so it works for native (+ve) and emulated
+    // (-ve) ids alike.
     chrome.tabs.query = function (queryInfo, callback) {
       const qi = { ...(queryInfo || {}) };
       const wantGroup = Object.prototype.hasOwnProperty.call(qi, 'groupId');
       const gid = qi.groupId;
       delete qi.groupId;
       const run = async () => {
-        let tabs = (await _q(qi)) || [];
+        let tabs = (await _natQuery(qi)) || [];
         const st = await getState();
         for (const t of tabs) {
-          if (t && typeof t.id === 'number') t.groupId = (st.memb[t.id] != null ? st.memb[t.id] : NONE);
+          if (t && typeof t.id === 'number') {
+            if (st.memb[t.id] != null) t.groupId = st.memb[t.id];
+            else if (typeof t.groupId !== 'number') t.groupId = NONE;
+          }
         }
         if (wantGroup) tabs = tabs.filter((t) => t.groupId === gid);
         return tabs;
@@ -574,20 +631,22 @@ if (typeof document !== 'undefined' &&
       return run();
     };
 
-    // Wrap get: annotate groupId on the single tab.
-    const _get = chrome.tabs.get.bind(chrome.tabs);
+    // Overlay get: same precedence — registry first, else native groupId.
     chrome.tabs.get = function (tabId, callback) {
       const run = async () => {
-        const t = await _get(tabId);
+        const t = await _natGet(tabId);
         const st = await getState();
-        if (t) t.groupId = (st.memb[tabId] != null ? st.memb[tabId] : NONE);
+        if (t) {
+          if (st.memb[tabId] != null) t.groupId = st.memb[tabId];
+          else if (typeof t.groupId !== 'number') t.groupId = NONE;
+        }
         return t;
       };
       if (typeof callback === 'function') { run().then(callback, () => callback(undefined)); return; }
       return run();
     };
 
-    // Prune membership when a grouped tab closes (background owns this once).
+    // Prune membership when a tracked tab closes (background owns this once).
     if (isBackground && api.tabs.onRemoved) {
       api.tabs.onRemoved.addListener(async (tabId) => {
         try {
@@ -598,7 +657,53 @@ if (typeof document !== 'undefined' &&
     }
   }
 
-  if (!chrome.tabGroups) {
+  if (nativeGroups && chrome.tabGroups) {
+    // Overlay native tabGroups so Claude's groups (real OR emulated) resolve from the
+    // registry, while user-made native groups still pass through.
+    const _tgGet    = chrome.tabGroups.get    ? chrome.tabGroups.get.bind(chrome.tabGroups)    : null;
+    const _tgQuery  = chrome.tabGroups.query  ? chrome.tabGroups.query.bind(chrome.tabGroups)  : null;
+    const _tgUpdate = chrome.tabGroups.update ? chrome.tabGroups.update.bind(chrome.tabGroups) : null;
+    const _tgMove   = chrome.tabGroups.move   ? chrome.tabGroups.move.bind(chrome.tabGroups)   : null;
+
+    chrome.tabGroups.get = async (id) => {
+      const st = await getState();
+      if (st.meta[id]) {
+        if (st.meta[id].native && _tgGet) { try { return await _tgGet(id); } catch {} }
+        return { ...st.meta[id] };
+      }
+      if (_tgGet) return _tgGet(id);
+      throw new Error(`No group with id: ${id}`);
+    };
+    chrome.tabGroups.query = async (qi = {}) => {
+      const st = await getState();
+      let nat = [];
+      if (_tgQuery) { try { nat = (await _tgQuery(qi)) || []; } catch {} }
+      const emu = Object.values(st.meta).filter((g) => !g.native).filter((g) =>
+        (qi.windowId == null || g.windowId === qi.windowId) &&
+        (qi.title == null || g.title === qi.title) &&
+        (qi.color == null || g.color === qi.color) &&
+        (qi.collapsed == null || g.collapsed === qi.collapsed)
+      ).map((g) => ({ ...g }));
+      return nat.concat(emu);
+    };
+    chrome.tabGroups.update = async (id, props) => {
+      const st = await getState();
+      if (st.meta[id]) {
+        Object.assign(st.meta[id], props || {});
+        await save({ [K_META]: st.meta });
+        if (st.meta[id].native && _tgUpdate) { try { return await _tgUpdate(id, props); } catch {} }
+        return { ...st.meta[id] };
+      }
+      if (_tgUpdate) return _tgUpdate(id, props);
+      return { id, ...(props || {}) };
+    };
+    chrome.tabGroups.move = async (id, props) => {
+      if (_tgMove) { try { return await _tgMove(id, props); } catch {} }
+      const st = await getState();
+      return { ...(st.meta[id] || { id }) };
+    };
+  } else if (!chrome.tabGroups) {
+    // FF ≤138: no native API at all — provide the full emulated object.
     chrome.tabGroups = {
       TAB_GROUP_ID_NONE: NONE,
       Color: {
@@ -621,7 +726,7 @@ if (typeof document !== 'undefined' &&
       },
       update: async (id, props) => {
         const st = await getState();
-        const m = st.meta[id] || { id, title: '', color: 'grey', collapsed: false };
+        const m = st.meta[id] || { id, title: '', color: 'grey', collapsed: false, native: false };
         Object.assign(m, props || {});
         st.meta[id] = m;
         await save({ [K_META]: st.meta });

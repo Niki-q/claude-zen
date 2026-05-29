@@ -53,16 +53,13 @@ Hand-written classic (non-module) scripts that are loaded **before** the bundle 
 
 - **`chrome.sidePanel` → `browser.sidebarAction`**: Firefox sidebar is shared globally; the shim accepts `setOptions({path: "sidepanel.html?tabId=N"})` and applies it globally via `browser.sidebarAction.setPanel()`. The global URL is fixed; the per-tab `tabId` is injected into the URL params by the deferred-module loader (see below) instead.
   
-- **`chrome.tabGroups`** (tab grouping): dual-mode, feature-detected via `nativeGroups` (`typeof chrome.tabGroups !== 'undefined' && typeof chrome.tabGroups.TAB_GROUP_ID_NONE === 'number'`):
-  - **Firefox 139+ (native)**: `chrome.tabGroups` + `chrome.tabs.group/ungroup` and `tabs.query({groupId})` / `tab.groupId` exist natively. The shim leaves them untouched (only aliasing `browser.*` → `chrome.*` if a callable is missing), so Claude's tabs land in a **real, visible OS group**. The `tabGroups` permission is requested in the manifest.
-  - **Firefox 128–138 (fallback emulation)**: emulated via a `storage.session` registry storing:
-    - `__ffGroupMeta`: maps groupId → `{id, title, color, collapsed, windowId}`
-    - `__ffTabGroup`: maps tabId → groupId
-    - `__ffGroupSeq`: auto-increment sequence for new group IDs
+- **`chrome.tabGroups`** (tab grouping): **HYBRID** design (feature-detected via `nativeGroups` = `chrome.tabGroups` exists with a numeric `TAB_GROUP_ID_NONE`). The crux: Firefox 139's *native* `chrome.tabs.group` **refuses to group privileged/extension pages** (`moz-extension://`, `about:*`, `chrome://`) — and Claude's "main tab" is frequently exactly that (a new-tab-page override), while freshly created scratch tabs open at `about:newtab`. Using native blindly meant `createGroup(mainTab)` threw, no group was ever created, and the agent couldn't control any new tab ("No group found for main tab", "not in the same group"). So the shim keeps a `storage.session` **registry as the unified membership source of truth**:
+  - **Groupable web tab** → creates a **real, visible native group**, mirrored into the registry (`native: true`).
+  - **Privileged tab / native rejection / FF ≤138** → emulates a logical group with a **negative id** (never collides with native positive ids or `NONE = -1`), `native: false`.
+  - `chrome.tabs.get`/`query` are **overlaid** so a tab's `groupId` comes from the registry when Claude manages it, else from the native value — real groups, emulated groups, and user-made native groups all report consistently. `chrome.tabGroups.get/query/update/move` are likewise overlaid (registry first, forwarding to native for `native:true` groups).
+  - Registry keys: `__ffGroupMeta` (groupId → `{id,title,color,collapsed,windowId,native}`), `__ffTabGroup` (tabId → groupId), `__ffGroupSeq` (next negative emulated id). The `tabGroups` permission is requested in the manifest.
 
-    Provides `chrome.tabs.group()`, `chrome.tabs.ungroup()`, and wraps `chrome.tabs.query()` + `chrome.tabs.get()` to annotate each tab's `groupId` from the registry. No visual group appears, but orchestration works logically.
-
-  **Access boundary**: the upstream bundle only acts on tabs whose `groupId` matches its own group, bailing when `tab.groupId === TAB_GROUP_ID_NONE` (checked in `service-worker.ts-*.js` and `sidepanel-*.js`) and enumerating sibling tabs via `tabs.query({groupId})` (in `mcpPermissions-*.js`). The group is therefore the access boundary — Claude only touches tabs inside the group it created. Both modes honor this; native mode makes it a real browser group.
+  **Access boundary**: the upstream bundle only acts on tabs whose group matches the session's group, bailing when `tab.groupId === TAB_GROUP_ID_NONE` (in `service-worker.ts-*.js` / `sidepanel-*.js`) and enumerating siblings via `tabs.query({groupId})` (in `mcpPermissions-*.js`). The group is the access boundary — Claude only touches tabs in the group it created. The hybrid honors this in both real and emulated modes.
 
 - **`chrome.debugger` (page automation via Chrome DevTools Protocol)**: Firefox has no debugger API. Translates CDP commands to Firefox `scripting.executeScript()`:
   - `Input.dispatchMouseEvent` → synthetic `MouseEvent` in page MAIN world
@@ -203,11 +200,11 @@ After `update-from-store.ps1` patches them:
 | `chrome.sidePanel.setOptions({tabId, path})` | `browser.sidebarAction.setPanel({panel: path})` (global, not per-tab) | `firefox-page-shims.js` |
 | `chrome.sidePanel.open()` | `browser.sidebarAction.open()` | `firefox-page-shims.js` |
 | `chrome.sidePanel.close()` | `browser.sidebarAction.close()` | `firefox-page-shims.js` |
-| `chrome.tabs.group({tabIds, groupId})` | FF 139+: native; FF ≤138: `storage.session` registry (`__ffTabGroup`, `__ffGroupMeta`, `__ffGroupSeq`) | `firefox-page-shims.js` |
-| `chrome.tabs.ungroup(tabIds)` | FF 139+: native; FF ≤138: remove from `__ffTabGroup` registry | `firefox-page-shims.js` |
-| `chrome.tabs.query({...})` | FF 139+: native (`groupId` filter supported); FF ≤138: wrapped to annotate `groupId` from registry | `firefox-page-shims.js` |
-| `chrome.tabs.get(tabId)` | FF 139+: native; FF ≤138: wrapped to annotate `groupId` | `firefox-page-shims.js` |
-| `chrome.tabGroups.*` | FF 139+: native; FF ≤138: stub `get()/query()/update()/move()` via registry | `firefox-page-shims.js` |
+| `chrome.tabs.group({tabIds, groupId})` | Hybrid: native group for groupable web tabs, else emulated negative-id group in the `storage.session` registry (`__ffGroupMeta`/`__ffTabGroup`/`__ffGroupSeq`) | `firefox-page-shims.js` |
+| `chrome.tabs.ungroup(tabIds)` | Remove from registry; also native-ungroup tabs in `native:true` groups | `firefox-page-shims.js` |
+| `chrome.tabs.query({...})` | Overlaid: `groupId` from registry when Claude-managed, else native; `groupId` filter applied in-shim | `firefox-page-shims.js` |
+| `chrome.tabs.get(tabId)` | Overlaid: registry `groupId` first, else native | `firefox-page-shims.js` |
+| `chrome.tabGroups.*` | FF 139+: overlay native (`get/query/update/move`) with registry; FF ≤138: full stub via registry | `firefox-page-shims.js` |
 | `chrome.tabs.create({url:"chrome://newtab"})` / `chrome.windows.create(...)` | Strip the `chrome://newtab` URL (Firefox rejects it as illegal) → Firefox opens its native new tab | `firefox-page-shims.js` |
 | `chrome.debugger.attach/detach/sendCommand` | `browser.scripting.executeScript()` for mutations; `tabs.captureVisibleTab()` for screenshots | `firefox-page-shims.js` |
 | `chrome.offscreen.createDocument()` | No-op (Firefox background is a real DOM page) | `firefox-page-shims.js` |
@@ -300,9 +297,9 @@ Example: contentEditable fields may not respond to synthetic keystrokes. The shi
 
 Firefox MV3 background scripts are real pages (not service workers) and don't sleep, but the original code may have assumed Chrome's 30-second idle kill. State is kept in `storage.session` (shared across background + sidepanel, survives SW unload, cleared on browser restart) rather than global variables.
 
-### Tab Groups: native on 139+, invisible fallback on ≤138
+### Tab Groups: hybrid native + emulated (privileged tabs can't be natively grouped)
 
-On **Firefox 139+** Claude's tabs are placed in a **real, visible OS tab group** via the native `chrome.tabGroups` / `chrome.tabs.group` APIs (requires the `tabGroups` manifest permission, present here). On **Firefox 128–138** the API is absent, so the shim falls back to a **logical-only** emulation — no visual grouping appears; the registry `__ffTabGroup`, `__ffGroupMeta`, `__ffGroupSeq` exists purely to track Claude's tab orchestration internally. Mode is chosen at runtime by the `nativeGroups` feature check in `firefox-page-shims.js`; verify with the console which path is active if grouping misbehaves.
+Native Firefox `chrome.tabs.group` (FF 139+) **rejects privileged/extension pages** (`moz-extension://`, `about:*`, `chrome://`). Since Claude's main tab is often a new-tab-page override and scratch tabs open at `about:newtab`, a real group can't always be made. The shim therefore runs a **hybrid** (see the `chrome.tabGroups` entry above): a real visible group for groupable web tabs, a negative-id **emulated** group otherwise, with the `storage.session` registry as the unified membership truth and `tabs.get/query` + `tabGroups.*` overlaid so the access boundary always resolves. A given session is "real" or "emulated" depending on the main tab's URL; emulated sessions have no visual group but the agent can still control its tabs. Mode is chosen at runtime by `nativeGroups` in `firefox-page-shims.js` — use `czDebug()` to watch the chat if grouping misbehaves.
 
 ## Conventions
 
