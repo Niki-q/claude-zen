@@ -163,7 +163,7 @@
             const existing = await threadForTab(anchorId);
             if (existing) {
               const nt = await new Promise((res) => {
-                try { const r = api.tabs.create({ active: true, url: 'https://claude.ai/new' }, (t) => res(t)); if (r && r.then) r.then(res, () => res(null)); }
+                try { const r = api.tabs.create({ active: true, url: 'https://duckduckgo.com' }, (t) => res(t)); if (r && r.then) r.then(res, () => res(null)); }
                 catch (e) { res(null); }
               });
               if (nt && nt.id != null) anchorId = nt.id;

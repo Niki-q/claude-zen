@@ -877,8 +877,8 @@ if (typeof document !== 'undefined' &&
           const t = await _natGet(tabId);
           const u = t && t.url;
           if (!u || PRIVILEGED.test(u)) {
-            await chrome.tabs.update(tabId, { url: 'https://claude.ai/new' });
-            console.log('[claude-zen][groups] ensureMainGroup: navigated privileged main tab', tabId, '→ claude.ai/new');
+            await chrome.tabs.update(tabId, { url: 'https://duckduckgo.com' });
+            console.log('[claude-zen][groups] ensureMainGroup: navigated privileged main tab', tabId, '→ duckduckgo.com');
           }
         } catch (e) {}
       }
