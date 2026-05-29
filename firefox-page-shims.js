@@ -571,7 +571,7 @@ if (typeof document !== 'undefined' &&
       }
       let windowId;
       try { windowId = (await _natGet(ids[0])).windowId; } catch {}
-      st.meta[gid] = { id: gid, title: '', color: 'grey', collapsed: false, windowId, native: false };
+      st.meta[gid] = { id: gid, title: '', color: 'grey', collapsed: false, windowId, native: false, mainTabId: ids[0] };
     }
     for (const id of ids) st.memb[id] = gid;
     await save({ [K_META]: st.meta, [K_MEMB]: st.memb, [K_SEQ]: st.seq });
@@ -624,7 +624,7 @@ if (typeof document !== 'undefined' &&
           let windowId;
           try { windowId = (await _natGet(ids[0])).windowId; } catch {}
           const fresh = await getState();
-          fresh.meta[ngid] = { id: ngid, title: '', color: 'grey', collapsed: false, windowId, native: true };
+          fresh.meta[ngid] = { id: ngid, title: '', color: 'grey', collapsed: false, windowId, native: true, mainTabId: ids[0] };
           for (const id of ids) fresh.memb[id] = ngid;
           await save({ [K_META]: fresh.meta, [K_MEMB]: fresh.memb });
           return ngid;
@@ -863,13 +863,38 @@ if (typeof document !== 'undefined' &&
   // groups freshly created tabs into it → the gate's findGroupByTab reconstructs the
   // group from chrome.tabs.query({groupId}) (our overlay) and access is granted.
   // Idempotent; native group when the tab is groupable, emulated otherwise.
-  self.__ffEnsureMainGroup = async (tabId) => {
+  self.__ffEnsureMainGroup = async (tabId, opts = {}) => {
     try {
       if (tabId == null || !chrome.tabs) return;
+      // The conversation's main tab is often a PRIVILEGED page (about:blank /
+      // about:newtab / a new-tab override) that Firefox refuses to put in a VISIBLE
+      // tab group — so it shows as "groupless" while the agent's scratch tabs (which
+      // navigate to real URLs) form the visible group. On explicit chat init / new
+      // thread (makeGroupable), send that tab to a real, groupable Claude page first
+      // so it can visibly join the group. Real pages are left untouched.
+      if (opts.makeGroupable) {
+        try {
+          const t = await _natGet(tabId);
+          const u = t && t.url;
+          if (!u || PRIVILEGED.test(u)) {
+            await chrome.tabs.update(tabId, { url: 'https://claude.ai/new' });
+            console.log('[claude-zen][groups] ensureMainGroup: navigated privileged main tab', tabId, '→ claude.ai/new');
+          }
+        } catch (e) {}
+      }
       const st = await getState();
-      if (st.memb[tabId] != null) return;   // already in a group
-      await groupFn({ tabIds: [tabId] });
-    } catch {}
+      if (st.memb[tabId] != null) {
+        console.log('[claude-zen][groups] ensureMainGroup: tab', tabId, 'already in group', st.memb[tabId]);
+        return;   // already in a group
+      }
+      const gid = await groupFn({ tabIds: [tabId] });
+      const fresh = await getState();
+      if (fresh.meta[gid] && fresh.meta[gid].mainTabId == null) {
+        fresh.meta[gid].mainTabId = tabId;
+        await save({ [K_META]: fresh.meta });
+      }
+      console.log('[claude-zen][groups] ensureMainGroup: grouped main tab', tabId, '→ group', gid);
+    } catch (e) { console.warn('[claude-zen][groups] ensureMainGroup FAILED', tabId, e && e.message); }
   };
 })();
 
@@ -1052,7 +1077,7 @@ if (!chrome.sidePanel) {
             const m = /[?&]tabId=(\d+)/.exec(opts.path);
             if (m) tid = Number(m[1]);
           }
-          if (tid != null && self.__ffEnsureMainGroup) await self.__ffEnsureMainGroup(tid);
+          if (tid != null && self.__ffEnsureMainGroup) await self.__ffEnsureMainGroup(tid, { makeGroupable: true });
         } catch {}
         if (opts && opts.path && browser.sidebarAction && browser.sidebarAction.setPanel) {
           // IMPORTANT: set a GLOBAL panel (no tabId), unlike Chrome's per-tab

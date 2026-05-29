@@ -163,13 +163,15 @@
             const existing = await threadForTab(anchorId);
             if (existing) {
               const nt = await new Promise((res) => {
-                try { const r = api.tabs.create({ active: true }, (t) => res(t)); if (r && r.then) r.then(res, () => res(null)); }
+                try { const r = api.tabs.create({ active: true, url: 'https://claude.ai/new' }, (t) => res(t)); if (r && r.then) r.then(res, () => res(null)); }
                 catch (e) { res(null); }
               });
               if (nt && nt.id != null) anchorId = nt.id;
             }
             // Seed/anchor the group on this tab so it becomes a switchable thread.
-            if (self.__ffEnsureMainGroup) await self.__ffEnsureMainGroup(anchorId);
+            // makeGroupable: if the adopted current tab is a privileged page, it gets
+            // sent to a groupable Claude page so it visibly joins the group.
+            if (self.__ffEnsureMainGroup) await self.__ffEnsureMainGroup(anchorId, { makeGroupable: true });
             sendResponse({ ok: true, mainTabId: anchorId, reused: !existing });
           } catch (e) { sendResponse({ ok: false, error: e && e.message }); }
         })();
