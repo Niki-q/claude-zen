@@ -969,6 +969,7 @@ if (!chrome.debugger) {
     const x = p.x, y = p.y, m = p.modifiers || 0;
     const el = document.elementFromPoint(x, y) || document.body;
     const button = { left: 0, middle: 1, right: 2, none: 0 }[p.button] ?? 0;
+    let clickMeta = null;
     const base = {
       bubbles: true, cancelable: true, composed: true, view: window,
       clientX: x, clientY: y, screenX: x, screenY: y,
@@ -1002,9 +1003,17 @@ if (!chrome.debugger) {
         break;
       case 'mouseReleased':
         fireP('pointerup'); fireM('mouseup');
-        if (button === 2) fireM('contextmenu');
-        else {
-          fireM('click');
+        if (button === 2) { fireM('contextmenu'); break; }
+        {
+          // Single click. Capture whether it propagated to document and whether a
+          // handler engaged (defaultPrevented / stopped propagation) — diagnostics
+          // to tell "handler ran but UI lagged" apart from "nothing handled it".
+          let reached = false;
+          const probe = () => { reached = true; };
+          document.addEventListener('click', probe, { capture: true, once: true });
+          const notPrevented = el.dispatchEvent(new MouseEvent('click', base));
+          document.removeEventListener('click', probe, { capture: true });
+          clickMeta = 'reachedDoc=' + reached + ' defaultPrevented=' + (!notPrevented);
           if ((p.clickCount || 1) >= 2) fireM('dblclick');
         }
         break;
@@ -1023,7 +1032,7 @@ if (!chrome.debugger) {
       if (t) s += ' "' + t.slice(0, 24) + '"';
       return s;
     };
-    return { dpr, x, y, hit: d(el), w: window.innerWidth, h: window.innerHeight };
+    return { dpr, x, y, hit: d(el), w: window.innerWidth, h: window.innerHeight, act: clickMeta };
   };
 
   const __ffKey = (p) => {
@@ -1115,7 +1124,11 @@ if (!chrome.debugger) {
 
       case 'Input.dispatchMouseEvent': {
         const r = await __ffExec(tabId, __ffMouse, [params]);
-        if (r && typeof r === 'object') console.log('[claude-zen][cdp] mouse', params.type, 'raw=(' + params.x + ',' + params.y + ') dpr=' + r.dpr + ' css=(' + Math.round(r.x) + ',' + Math.round(r.y) + ') viewport=' + r.w + 'x' + r.h + ' hit=' + r.hit);
+        if (r && typeof r === 'object') console.log('[claude-zen][cdp] mouse', params.type, 'raw=(' + params.x + ',' + params.y + ') dpr=' + r.dpr + ' css=(' + Math.round(r.x) + ',' + Math.round(r.y) + ') viewport=' + r.w + 'x' + r.h + ' hit=' + r.hit + (r.act ? ' [' + r.act + ']' : ''));
+        // Let SPA frameworks paint the result before the agent's next screenshot —
+        // our executeScript dispatch is synchronous, so without a beat the screenshot
+        // can race ahead of the click's re-render and the agent thinks it missed.
+        if (params.type === 'mouseReleased') { await new Promise((res) => setTimeout(res, 120)); }
         return {};
       }
       case 'Input.dispatchKeyEvent': {
