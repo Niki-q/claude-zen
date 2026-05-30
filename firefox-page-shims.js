@@ -1346,6 +1346,16 @@ if (chrome.runtime && typeof chrome.runtime.sendMessage === 'function') {
       if (m.type === 'REVOKE_BLOB_URL')      { URL.revokeObjectURL(m.blobUrl); return { success: true }; }
     } catch (e) { return { success: false, error: e?.message }; }
   };
+  // Firefox is stricter than Chrome about message-channel lifetime. The Chrome
+  // bundle has onMessage listeners that return true (or are async) and don't always
+  // call sendResponse, and it fires messages without awaiting a real reply. In
+  // Chrome an unanswered sendMessage just resolves undefined; in Firefox the
+  // sender's promise REJECTS — "Promised response from onMessage listener went out
+  // of scope" / "message channel closed" / "Receiving end does not exist" — which
+  // surfaces as noisy unhandled rejections from the minified bundle (we can't edit
+  // assets/). Swallow ONLY those benign channel errors on the promise path and
+  // resolve undefined, restoring Chrome's behavior. Anything else is rethrown.
+  const BENIGN_MSG = /out of scope|message channel closed|port closed|Receiving end does not exist|establish connection/i;
   chrome.runtime.sendMessage = function (...args) {
     const m = args[0];
     const cb = typeof args[args.length - 1] === 'function' ? args[args.length - 1] : undefined;
@@ -1354,7 +1364,14 @@ if (chrome.runtime && typeof chrome.runtime.sendMessage === 'function') {
       if (cb) { p.then(cb, () => cb(undefined)); return; }
       return p;
     }
-    return _send(...args);
+    const r = _send(...args);
+    if (!cb && r && typeof r.then === 'function') {
+      return r.catch((e) => {
+        if (BENIGN_MSG.test((e && e.message) || '')) return undefined;
+        throw e;
+      });
+    }
+    return r;
   };
 }
 
