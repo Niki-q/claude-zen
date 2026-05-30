@@ -1013,7 +1013,18 @@ if (!chrome.debugger) {
         el.dispatchEvent(new WheelEvent('wheel', { ...base, deltaX: p.deltaX || 0, deltaY: p.deltaY || 0 }));
         break;
     }
-    return true;
+    // Diagnostic: report DPR, resolved CSS coords, and what we actually hit so the
+    // extension-context caller can log it (page-world console isn't visible there).
+    const d = (e) => {
+      if (!e) return 'null';
+      let s = e.tagName ? e.tagName.toLowerCase() : '?';
+      if (e.id) s += '#' + e.id;
+      if (e.className && typeof e.className === 'string') s += '.' + e.className.trim().split(/\s+/).slice(0, 2).join('.');
+      const t = (e.textContent || '').trim().replace(/\s+/g, ' ');
+      if (t) s += ' "' + t.slice(0, 24) + '"';
+      return s;
+    };
+    return { dpr, x, y, hit: d(el), w: window.innerWidth, h: window.innerHeight };
   };
 
   const __ffKey = (p) => {
@@ -1038,7 +1049,8 @@ if (!chrome.debugger) {
       if (p.key === 'Backspace') { try { document.execCommand('delete'); } catch {} }
       else if (p.key === 'Delete') { try { document.execCommand('forwardDelete'); } catch {} }
     }
-    return true;
+    const a = document.activeElement;
+    return { active: a ? ((a.tagName || '?').toLowerCase() + (a.id ? '#' + a.id : '') + (a.isContentEditable ? '[ce]' : '') + ('value' in a ? '[input]' : '')) : 'null' };
   };
 
   const __ffInsertText = (text) => {
@@ -1085,6 +1097,16 @@ if (!chrome.debugger) {
 
       case 'Page.captureScreenshot': {
         const tab = await __ffApi.tabs.get(tabId);
+        // captureVisibleTab grabs the ACTIVE tab of the window, not an arbitrary
+        // target. If the agent's tab isn't active, the agent "sees" the wrong tab
+        // and loops. Log a loud warning so this is visible in the field.
+        try {
+          const act = await __ffApi.tabs.query({ active: true, windowId: tab.windowId });
+          const activeId = act && act[0] && act[0].id;
+          if (activeId !== tab.id) {
+            console.warn('[claude-zen][cdp] screenshot MISMATCH: target tab', tab.id, '(' + (tab.url || '').slice(0, 40) + ') is NOT active in window', tab.windowId, '— capturing active tab', activeId, 'instead');
+          }
+        } catch {}
         const dataUrl = await __ffApi.tabs.captureVisibleTab(tab.windowId, {
           format: params.format === 'jpeg' ? 'jpeg' : 'png',
           ...(params.quality != null ? { quality: params.quality } : {}),
@@ -1092,15 +1114,21 @@ if (!chrome.debugger) {
         return { data: String(dataUrl).replace(/^data:image\/\w+;base64,/, '') };
       }
 
-      case 'Input.dispatchMouseEvent':
-        await __ffExec(tabId, __ffMouse, [params]);
+      case 'Input.dispatchMouseEvent': {
+        const r = await __ffExec(tabId, __ffMouse, [params]);
+        if (r && typeof r === 'object') console.log('[claude-zen][cdp] mouse', params.type, 'raw=(' + params.x + ',' + params.y + ') dpr=' + r.dpr + ' css=(' + Math.round(r.x) + ',' + Math.round(r.y) + ') viewport=' + r.w + 'x' + r.h + ' hit=' + r.hit);
         return {};
-      case 'Input.dispatchKeyEvent':
-        await __ffExec(tabId, __ffKey, [params]);
+      }
+      case 'Input.dispatchKeyEvent': {
+        const r = await __ffExec(tabId, __ffKey, [params]);
+        console.log('[claude-zen][cdp] key', params.type, 'key=' + JSON.stringify(params.key) + ' active=' + (r && r.active));
         return {};
-      case 'Input.insertText':
-        await __ffExec(tabId, __ffInsertText, [params.text]);
+      }
+      case 'Input.insertText': {
+        const r = await __ffExec(tabId, __ffInsertText, [params.text]);
+        console.log('[claude-zen][cdp] insertText ' + JSON.stringify(String(params.text).slice(0, 30)) + ' result=' + JSON.stringify(r));
         return {};
+      }
 
       case 'Runtime.evaluate': {
         const value = await __ffExec(tabId, __ffEval, [params.expression]);
