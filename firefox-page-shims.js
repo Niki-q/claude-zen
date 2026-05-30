@@ -956,7 +956,7 @@ if (!chrome.debugger) {
   };
 
   // ── Injected page-world helpers (self-contained — serialized by executeScript) ──
-  const __ffMouse = (p) => {
+  const __ffMouse = async (p) => {
     // Coordinate space: tabs.captureVisibleTab (our Page.captureScreenshot) returns
     // a CSS-pixel image — its dimensions EQUAL the page's CSS viewport, not device
     // pixels. Verified in the field: a 1077×836 screenshot of a 1077×836 viewport at
@@ -1005,16 +1005,31 @@ if (!chrome.debugger) {
         fireP('pointerup'); fireM('mouseup');
         if (button === 2) { fireM('contextmenu'); break; }
         {
-          // Single click. Capture whether it propagated to document and whether a
-          // handler engaged (defaultPrevented / stopped propagation) — diagnostics
-          // to tell "handler ran but UI lagged" apart from "nothing handled it".
+          // Observe DOM mutations across the click to learn whether it actually did
+          // ANYTHING — the decisive signal that separates "click works, the agent
+          // just screenshotted too early" (mutations>0) from "the site ignores the
+          // synthetic click" (mutations==0 → isTrusted/handler gap).
+          let mutations = 0;
+          let obs = null;
+          try { obs = new MutationObserver((list) => { mutations += list.length; }); obs.observe(document.documentElement, { subtree: true, childList: true, attributes: true, characterData: true }); } catch {}
           let reached = false;
           const probe = () => { reached = true; };
           document.addEventListener('click', probe, { capture: true, once: true });
-          const notPrevented = el.dispatchEvent(new MouseEvent('click', base));
+          // Native activation (el.click()) runs the element's activation behavior and
+          // is the most reliable "click this" primitive; fall back to a dispatched
+          // event if it's unavailable or throws (SVG / cross-doc / detached nodes).
+          let notPrevented = true;
+          if (m === 0 && typeof el.click === 'function') {
+            try { el.click(); } catch { notPrevented = el.dispatchEvent(new MouseEvent('click', base)); }
+          } else {
+            notPrevented = el.dispatchEvent(new MouseEvent('click', base));
+          }
           document.removeEventListener('click', probe, { capture: true });
-          clickMeta = 'reachedDoc=' + reached + ' defaultPrevented=' + (!notPrevented);
           if ((p.clickCount || 1) >= 2) fireM('dblclick');
+          // Give sync handlers + a frame of async re-render time to mutate the DOM.
+          await new Promise((r) => setTimeout(r, 160));
+          try { if (obs) obs.disconnect(); } catch {}
+          clickMeta = 'reachedDoc=' + reached + ' defaultPrevented=' + (!notPrevented) + ' domMutations=' + mutations;
         }
         break;
       case 'mouseWheel':
@@ -1125,10 +1140,8 @@ if (!chrome.debugger) {
       case 'Input.dispatchMouseEvent': {
         const r = await __ffExec(tabId, __ffMouse, [params]);
         if (r && typeof r === 'object') console.log('[claude-zen][cdp] mouse', params.type, 'raw=(' + params.x + ',' + params.y + ') dpr=' + r.dpr + ' css=(' + Math.round(r.x) + ',' + Math.round(r.y) + ') viewport=' + r.w + 'x' + r.h + ' hit=' + r.hit + (r.act ? ' [' + r.act + ']' : ''));
-        // Let SPA frameworks paint the result before the agent's next screenshot —
-        // our executeScript dispatch is synchronous, so without a beat the screenshot
-        // can race ahead of the click's re-render and the agent thinks it missed.
-        if (params.type === 'mouseReleased') { await new Promise((res) => setTimeout(res, 120)); }
+        // (mouseReleased already waits ~160ms inside __ffMouse for the DOM to settle
+        // before resolving, so the agent's next screenshot reflects the click.)
         return {};
       }
       case 'Input.dispatchKeyEvent': {
