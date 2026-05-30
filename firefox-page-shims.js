@@ -995,12 +995,22 @@ if (!chrome.debugger) {
       case 'mouseMoved':
         fireP('pointermove'); fireM('mousemove');
         break;
-      case 'mousePressed':
+      case 'mousePressed': {
+        // Some widgets (incl. many date pickers) select on mousedown/pointerdown,
+        // which arrive as THIS separate CDP call — observe mutations here too, and
+        // dump the hit element's HTML so we can see disabled/structure.
+        let pm = 0, po = null;
+        try { po = new MutationObserver((l) => { pm += l.length; }); po.observe(document.documentElement, { subtree: true, childList: true, attributes: true, characterData: true }); } catch {}
         // hover first so :hover / pointer-enter handlers settle before the press
         fireP('pointerover');  fireM('mouseover');
         fireP('pointerdown', 0.5); fireM('mousedown');
         if (el.focus) { try { el.focus(); } catch {} }
+        await new Promise((r) => setTimeout(r, 120));
+        try { if (po) po.disconnect(); } catch {}
+        let html = ''; try { html = (el.outerHTML || '').slice(0, 140).replace(/\s+/g, ' '); } catch {}
+        clickMeta = 'pressMutations=' + pm + ' el=' + html;
         break;
+      }
       case 'mouseReleased':
         fireP('pointerup'); fireM('mouseup');
         if (button === 2) { fireM('contextmenu'); break; }
@@ -1043,6 +1053,11 @@ if (!chrome.debugger) {
       let s = e.tagName ? e.tagName.toLowerCase() : '?';
       if (e.id) s += '#' + e.id;
       if (e.className && typeof e.className === 'string') s += '.' + e.className.trim().split(/\s+/).slice(0, 2).join('.');
+      const flags = [];
+      try { if (e.disabled) flags.push('disabled'); } catch {}
+      try { if (e.getAttribute && e.getAttribute('aria-disabled') === 'true') flags.push('aria-disabled'); } catch {}
+      try { const cs = getComputedStyle(e); if (cs && cs.pointerEvents === 'none') flags.push('pe:none'); } catch {}
+      if (flags.length) s += '{' + flags.join(',') + '}';
       const t = (e.textContent || '').trim().replace(/\s+/g, ' ');
       if (t) s += ' "' + t.slice(0, 24) + '"';
       return s;
