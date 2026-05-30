@@ -957,7 +957,17 @@ if (!chrome.debugger) {
 
   // ── Injected page-world helpers (self-contained — serialized by executeScript) ──
   const __ffMouse = (p) => {
-    const x = p.x, y = p.y, m = p.modifiers || 0;
+    // Coordinate space: our Page.captureScreenshot is tabs.captureVisibleTab, which
+    // returns a DEVICE-pixel image (scaled by devicePixelRatio), and the agent picks
+    // click coordinates in that image's pixel space. But document.elementFromPoint
+    // and MouseEvent.clientX/Y are CSS pixels. On a HiDPI / Windows-scaled display
+    // (DPR>1, e.g. 125% → a 1077×836 shot of an 861×669 viewport) the two spaces
+    // differ, so clicks landed at the wrong point (often on nothing) and the agent
+    // looped re-screenshotting. Convert device px → CSS px by dividing by DPR.
+    // No-op when DPR==1. (Real Chrome CDP avoids this: Page.captureScreenshot there
+    // returns CSS-resolution images, matching Input.dispatchMouseEvent's CSS coords.)
+    const dpr = window.devicePixelRatio || 1;
+    const x = p.x / dpr, y = p.y / dpr, m = p.modifiers || 0;
     const el = document.elementFromPoint(x, y) || document.body;
     const button = { left: 0, middle: 1, right: 2, none: 0 }[p.button] ?? 0;
     const base = {
