@@ -357,6 +357,7 @@ Native Firefox `chrome.tabs.group` (FF 139+) **rejects privileged/extension page
 - `lastAuthFailureReason`: diagnostic
 - `__czDebugMirror`: boolean — enables the chat→console debug mirror (see Debug Mode)
 - `__czSessionLog`: array — persistent ring-buffer debug log (see Debug Mode → Persistent session log); dump with `czDumpLog()`
+- `__czPreferEmulatedGroups`: boolean — manual override for grouping mode (`true`=force registry-only/emulated, `false`=force native, unset=auto-detect Zen). Set via `czEmulateGroups(true/false)`. See `docs/ZEN_TABS_AND_FOLDERS.md`
 
 ### Extension IDs
 

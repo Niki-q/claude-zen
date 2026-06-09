@@ -596,6 +596,18 @@ if (typeof document !== 'undefined' &&
   // namespace (nativeGroups) — otherwise FF 138 users get no visible group at all.
   // nativeGroups stays the gate only for the title/color overlay (FF 139+).
   const canGroup = typeof _natGroup === 'function';
+
+  // Zen Browser's native tab groups "work poorly", and its pinned-tab FOLDERS have no
+  // WebExtension API. So in Zen we run REGISTRY-ONLY (emulated): skip native visual groups
+  // entirely. Membership / threads / the access gate are unaffected (they read the
+  // registry), and Claude tabs are marked another way — a "◆ " tab-title prefix applied by
+  // firefox-thread-jump.js on emulated members. `nativeAllowed()` is the runtime gate
+  // everything checks instead of `canGroup`; gating `isGroupable` on it makes BOTH group
+  // creation and the visual-promotion listener fall back to emulated automatically.
+  // emulatedMode is resolved async just after startup (group creation happens later, when a
+  // session starts, so it's set by then).
+  let emulatedMode = false;
+  const nativeAllowed = () => canGroup && !emulatedMode;
   if (isBackground) {
     try {
       console.log('[claude-zen][groups] init',
@@ -604,10 +616,46 @@ if (typeof document !== 'undefined' &&
     } catch {}
   }
 
+  // Resolve emulatedMode: a manual override (storage.local.__czPreferEmulatedGroups —
+  // true=force emulated, false=force native) wins; otherwise auto-detect Zen. Detection is
+  // best-effort (Zen often keeps a Firefox UA) — getBrowserInfo() name/vendor + a UA scan;
+  // the manual override / czEmulateGroups() is the reliable escape hatch if it misses.
+  (async () => {
+    try {
+      const lstore = api.storage && api.storage.local; // toggle must survive restart → local
+      let forced;
+      try { const o = lstore && await lstore.get('__czPreferEmulatedGroups'); forced = o && o.__czPreferEmulatedGroups; } catch {}
+      if (forced === true || forced === false) {
+        emulatedMode = forced;
+      } else {
+        let zen = false;
+        try { if (/\bzen\b/i.test((typeof navigator !== 'undefined' && navigator.userAgent) || '')) zen = true; } catch {}
+        try {
+          if (!zen && api.runtime && api.runtime.getBrowserInfo) {
+            const bi = await api.runtime.getBrowserInfo();
+            if (/zen/i.test(((bi && bi.name) || '') + ' ' + ((bi && bi.vendor) || ''))) zen = true;
+          }
+        } catch {}
+        emulatedMode = zen;
+      }
+    } catch {}
+    self.__ffEmulatedGroups = emulatedMode;
+    if (isBackground) console.log('[claude-zen][groups] emulatedMode=' + emulatedMode + (emulatedMode ? ' (Zen/registry-only — no native groups; Claude tabs marked via ◆ title prefix)' : ''));
+  })();
+
+  // Console helper: force emulated grouping on/off (persists; reload for full effect).
+  self.czEmulateGroups = function (on) {
+    const v = (on === undefined) ? true : !!on;
+    emulatedMode = v; self.__ffEmulatedGroups = v;
+    try { if (api.storage && api.storage.local) api.storage.local.set({ __czPreferEmulatedGroups: v }); } catch {}
+    console.log('[claude-zen][groups] emulatedMode → ' + v + ' (reload the extension for full effect)');
+    return v;
+  };
+
   // Tabs showing these schemes cannot be placed in a native Firefox tab group.
   const PRIVILEGED = /^(moz-extension|chrome-extension|about|chrome|view-source|data|resource|file):/i;
   const isGroupable = async (id) => {
-    if (!canGroup || !_natGet) return false;
+    if (!nativeAllowed() || !_natGet) return false;
     try { const t = await _natGet(id); const u = t && t.url; return !!u && !PRIVILEGED.test(u); }
     catch { return false; }
   };

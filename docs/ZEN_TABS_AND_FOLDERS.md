@@ -1,6 +1,29 @@
 # Claude Zen in the Zen Browser: tabs, groups & folders
 
-Status: **design note / open question** (no behavioural code change yet — see "Decision needed").
+Status: **implemented** — auto-detect Zen → registry-only (emulated) grouping, with a
+`◆ ` tab-title marker replacing the orange native group. Decision below was made by the
+user (2026-06): auto-detect Zen = yes; losing the orange group = fine, mark another way.
+
+## What shipped
+
+- **Auto-detect Zen** (`firefox-page-shims.js`, tab-groups IIFE): `emulatedMode` is set from
+  a manual override (`storage.local.__czPreferEmulatedGroups`) if present, else by
+  auto-detecting Zen via `runtime.getBrowserInfo()` name/vendor + a UA scan. When on,
+  `nativeAllowed()` is false → `isGroupable()` returns false → both group creation and the
+  visual-promotion listener fall back to the emulated registry path (no native FF groups).
+  - **Caveat:** Zen usually keeps a Firefox UA, so auto-detect is best-effort. If it
+    misses, run `czEmulateGroups(true)` in the console (persists) — that's the reliable
+    escape hatch. `czEmulateGroups(false)` forces native back on.
+- **Alternative marking**: `FF_THREAD_MEMBERSHIP` now returns `mark: !thread.native`, and
+  `firefox-thread-jump.js` prefixes the tab title with `◆ ` (kept in place by a `<title>`
+  MutationObserver, since SPAs rewrite the title) for emulated/Zen members. Native-group
+  threads keep the orange "Claude" chrome and get no extra marker.
+
+The original analysis is kept below for context.
+
+---
+
+Status (historical): design note / open question.
 
 ## The problem
 

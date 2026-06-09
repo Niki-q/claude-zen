@@ -36,6 +36,33 @@
 
   const removeBtn = () => { if (btn) { btn.remove(); btn = null; } };
 
+  // Tab-title marker for threads WITHOUT a visible native group (emulated / Zen
+  // registry-only): prefix the page title with "◆ " so the tab is recognisable as a
+  // Claude tab in the tab strip. Re-applied via a MutationObserver because SPAs (incl.
+  // claude.ai) rewrite document.title on navigation.
+  const MARK = '◆ ';
+  let titleObs = null;
+  const applyMark = () => {
+    try {
+      if (document.title && document.title.indexOf(MARK) !== 0) document.title = MARK + document.title;
+      if (!titleObs) {
+        const tEl = document.querySelector('title');
+        if (tEl) {
+          titleObs = new MutationObserver(() => {
+            if (document.title && document.title.indexOf(MARK) !== 0) document.title = MARK + document.title;
+          });
+          titleObs.observe(tEl, { childList: true, characterData: true, subtree: true });
+        }
+      }
+    } catch (e) {}
+  };
+  const removeMark = () => {
+    try {
+      if (titleObs) { titleObs.disconnect(); titleObs = null; }
+      if (document.title && document.title.indexOf(MARK) === 0) document.title = document.title.slice(MARK.length);
+    } catch (e) {}
+  };
+
   const showBtn = () => {
     if (btn || !document.body) return;
     btn = document.createElement('button');
@@ -56,7 +83,10 @@
 
   const check = async () => {
     const resp = await send({ type: 'FF_THREAD_MEMBERSHIP' });
-    if (resp && resp.inGroup) showBtn(); else removeBtn();
+    if (resp && resp.inGroup) {
+      showBtn();
+      if (resp.mark) applyMark(); else removeMark();
+    } else { removeBtn(); removeMark(); }
   };
 
   check();

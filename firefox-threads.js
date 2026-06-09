@@ -121,7 +121,10 @@
       if (msg.type === 'FF_THREAD_MEMBERSHIP') {
         const tid = (sender && sender.tab && sender.tab.id != null) ? sender.tab.id : msg.tabId;
         threadForTab(tid)
-          .then((t) => sendResponse(t ? { inGroup: true, groupId: t.groupId, mainTabId: t.mainTabId } : { inGroup: false }))
+          // mark: this thread has no visible NATIVE group (emulated, or Zen registry-only),
+          // so the page should mark itself another way (◆ title prefix). Native-group
+          // threads already show the orange "Claude" chrome, so no extra marker there.
+          .then((t) => sendResponse(t ? { inGroup: true, groupId: t.groupId, mainTabId: t.mainTabId, mark: !t.native } : { inGroup: false }))
           .catch(() => sendResponse({ inGroup: false }));
         return true; // async response
       }
