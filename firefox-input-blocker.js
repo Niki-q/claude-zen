@@ -42,29 +42,66 @@
 
   let active = false;
 
+  // Controls the user must always be able to click while blocking is on:
+  //   #claude-agent-stop-container       — the bundle's stop button (pulsing/main tab)
+  //   #claude-static-indicator-container — the bundle's static indicator on driven
+  //                                        tabs (its "Open chat" / close buttons)
+  //   #__cz_stop_btn                     — our injected stop button (see ensureStop)
+  const ALLOW = '#claude-agent-stop-container,#claude-static-indicator-container,#__cz_stop_btn';
+
   const handler = (ev) => {
     if (!active) return;
     if (!ev.isTrusted) return; // Claude's synthetic events — let them through
     const t = ev.target;
-    // Keep the Stop-Claude control usable.
-    if (t && t.closest && t.closest('#claude-agent-stop-container')) return;
+    if (t && t.closest && t.closest(ALLOW)) return; // keep stop / indicator controls usable
     ev.stopImmediatePropagation();
     ev.preventDefault();
   };
 
-  const setActive = (on) => {
-    if (on === active) return;
-    active = on;
-    for (const type of BLOCKED) {
-      if (on) window.addEventListener(type, handler, { capture: true, passive: false });
-      else window.removeEventListener(type, handler, { capture: true });
+  // The bundle only injects its real stop button (#claude-agent-stop-container) on the
+  // session's MAIN tab (the "pulsing" indicator). The tabs the agent actually DRIVES get
+  // the "static" indicator, which has NO stop button — so the user has no way to stop the
+  // agent from the page they're watching. Inject our own stop affordance there; it sends
+  // the same STOP_AGENT message the bundle's button does (SW resolves the main tab and
+  // routes it to the sidepanel, which aborts).
+  let stopBtn = null;
+  const ensureStop = () => {
+    if (window.top !== window) return; // top frame only — never inject inside iframes
+    if (stopBtn || !document.body) return;
+    if (document.getElementById('claude-agent-stop-container')) return; // bundle's own stop present
+    stopBtn = document.createElement('button');
+    stopBtn.id = '__cz_stop_btn';
+    stopBtn.type = 'button';
+    stopBtn.textContent = '■ Stop Claude';
+    stopBtn.style.cssText = 'position:fixed;top:12px;left:50%;transform:translateX(-50%);z-index:2147483647;background:#d33;color:#fff;border:none;border-radius:999px;padding:8px 16px;font:600 13px/1 system-ui,-apple-system,sans-serif;cursor:pointer;box-shadow:0 3px 12px rgba(0,0,0,.35)';
+    stopBtn.onclick = () => { try { chrome.runtime.sendMessage({ type: 'STOP_AGENT', fromTabId: 'CURRENT_TAB' }); } catch (e) {} };
+    document.body.appendChild(stopBtn);
+  };
+  const removeStop = () => { if (stopBtn) { try { stopBtn.remove(); } catch (e) {} stopBtn = null; } };
+
+  const setActive = (on, kind) => {
+    if (on !== active) {
+      active = on;
+      for (const type of BLOCKED) {
+        if (on) window.addEventListener(type, handler, { capture: true, passive: false });
+        else window.removeEventListener(type, handler, { capture: true });
+      }
     }
+    if (!on) { removeStop(); return; }
+    // Only driven ("static") tabs lack a native stop button — inject ours there. On the
+    // main ("pulsing") tab the bundle injects #claude-agent-stop-container itself; let it
+    // (ensureStop also bails if that container is present, guarding the race either way).
+    if (kind === 'static') setTimeout(ensureStop, 150);
   };
 
   chrome.runtime.onMessage.addListener((msg) => {
     if (!msg || !msg.type) return;
-    if (msg.type === 'SHOW_AGENT_INDICATORS') setActive(true);
-    else if (msg.type === 'HIDE_AGENT_INDICATORS') setActive(false);
+    // "pulsing" (main tab) → SHOW_AGENT_INDICATORS; "static" (driven tabs) →
+    // SHOW_STATIC_INDICATOR. BOTH mean the agent session is active on this tab, so
+    // block real user input in either state. "none" → HIDE_AGENT_INDICATORS.
+    if (msg.type === 'SHOW_AGENT_INDICATORS') setActive(true, 'agent');
+    else if (msg.type === 'SHOW_STATIC_INDICATOR') setActive(true, 'static');
+    else if (msg.type === 'HIDE_AGENT_INDICATORS' || msg.type === 'HIDE_STATIC_INDICATOR') setActive(false);
     // do not return true / sendResponse — the indicator script owns the reply
   });
 

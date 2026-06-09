@@ -1,6 +1,11 @@
 # Captured browser session — contains claude.ai cookies/tokens, never commit
 *.har
 
+# Local credentials / API keys — never commit
+secrets/
+*.credentials.json
+google_credentials.json
+
 # OS / editor junk
 .DS_Store
 Thumbs.db

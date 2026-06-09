@@ -105,6 +105,16 @@
       })();
     }
 
+    // True only when the message came from one of OUR extension pages (sidepanel),
+    // not from a content script / web page. Used to gate handlers that act on an
+    // arbitrary, caller-supplied tabId (focus / open tabs), so a compromised or buggy
+    // content script can't drive the user's tabs. Membership/jump handlers stay open
+    // to content scripts because they only ever act on the SENDER'S OWN tab.
+    let __selfPrefix = '';
+    try { __selfPrefix = api.runtime.getURL('/'); } catch (e) {}
+    const fromExtPage = (sender) =>
+      !!(sender && typeof sender.url === 'string' && __selfPrefix && sender.url.indexOf(__selfPrefix) === 0);
+
     api.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       if (!msg || typeof msg.type !== 'string' || msg.type.indexOf('FF_') !== 0) return;
 
@@ -117,6 +127,7 @@
       }
 
       if (msg.type === 'FF_FOCUS_TAB') {
+        if (!fromExtPage(sender)) { sendResponse({ ok: false, error: 'forbidden' }); return true; }
         (async () => {
           try {
             await api.tabs.update(msg.tabId, { active: true });
@@ -145,6 +156,7 @@
       }
 
       if (msg.type === 'FF_NEW_THREAD') {
+        if (!fromExtPage(sender)) { sendResponse({ ok: false, error: 'forbidden' }); return true; }
         (async () => {
           try {
             // "this tab" = the tab the user is currently on (active, focused window).
@@ -179,6 +191,48 @@
       }
       return;
     });
+
+    // ── Scope the GLOBAL Firefox sidebar to Claude's tabs ──────────────────────
+    // Firefox's sidebar is one global instance shown on EVERY tab and window, so it
+    // lingers on pages that have nothing to do with Claude. When the user activates a
+    // tab that is NOT part of any Claude thread (and isn't the tab the sidebar is
+    // pinned to), close it. We canNOT auto-reopen on return — Firefox requires a live
+    // user gesture to OPEN a sidebar — so the user reopens with Ctrl+E; but it no longer
+    // sticks to unrelated tabs/windows. The sidepanel records its pinned tab in
+    // storage.session (__ffSidebarTab) so we never close the sidebar's own tab.
+    const K_SIDETAB = '__ffSidebarTab';
+    const sidebarPinnedTab = async () => {
+      try { const o = await store.get(K_SIDETAB); const v = o && o[K_SIDETAB]; return v != null ? Number(v) : null; }
+      catch (e) { return null; }
+    };
+    const closeSidebarIfForeign = async (tabId) => {
+      try {
+        if (tabId == null || !api.sidebarAction) return;
+        let open = true;
+        try { if (api.sidebarAction.isOpen) open = await api.sidebarAction.isOpen({}); } catch (e) {}
+        if (!open) return;                                  // nothing to close
+        if (tabId === await sidebarPinnedTab()) return;      // the sidebar's own tab — keep
+        const t = await threadForTab(tabId);
+        if (t) return;                                       // a Claude thread tab — keep
+        try { await api.sidebarAction.close(); } catch (e) {} // foreign tab — close (best-effort)
+      } catch (e) {}
+    };
+    if (api.tabs && api.tabs.onActivated) {
+      api.tabs.onActivated.addListener((info) => { if (info) closeSidebarIfForeign(info.tabId); });
+    }
+    if (api.windows && api.windows.onFocusChanged) {
+      api.windows.onFocusChanged.addListener(async (winId) => {
+        try {
+          if (winId == null || (api.windows.WINDOW_ID_NONE != null && winId === api.windows.WINDOW_ID_NONE)) return;
+          const tabs = await new Promise((res) => {
+            try { const r = api.tabs.query({ active: true, windowId: winId }, (t) => res(t || [])); if (r && r.then) r.then(res, () => res([])); }
+            catch (e) { res([]); }
+          });
+          if (tabs[0] && tabs[0].id != null) closeSidebarIfForeign(tabs[0].id);
+        } catch (e) {}
+      });
+    }
+
     console.log(LOG, 'background handlers ready');
   }
 
@@ -200,6 +254,11 @@
         u.searchParams.set('tabId', String(tabId));
         location.replace(u.toString()); // full reload → bundle re-runs for that thread
       };
+
+      // Record which tab THIS sidebar is pinned to, so the background's sidebar-scoping
+      // (closeSidebarIfForeign) never closes the sidebar on its own tab. Re-runs on every
+      // repoint reload (location.replace re-loads this script).
+      try { const tid = curTabId(); if (tid != null) store.set({ __ffSidebarTab: tid }); } catch (e) {}
       // Start a new thread. Background adopts the current page as the thread when it
       // isn't already a Claude thread, else opens a fresh tab; we then point the
       // sidebar at it. Resolves to a clean new context, so there's no history to lose.

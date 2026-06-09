@@ -709,6 +709,33 @@ if (typeof document !== 'undefined' &&
         } catch {}
       });
     }
+
+    // Prune a MEMBER tab when the USER navigates it away. The agent drives pages by
+    // clicking links / submitting forms (transitionType 'link' / 'form_submit') and
+    // never types in the address bar — so a top-frame navigation that is 'typed' /
+    // 'generated' / a bookmark, or carries the 'from_address_bar' qualifier, means the
+    // user repurposed the tab and it has left Claude's control. Drop it from the
+    // registry so the "◆ Open in Claude" button (and the access boundary) no longer
+    // treat it as part of the thread. The thread's MAIN tab is kept (it anchors the
+    // thread for jump-back). Reloads keep the same URL → not treated as "away".
+    if (isBackground && api.webNavigation && api.webNavigation.onCommitted) {
+      const USER_NAV = /^(typed|generated|keyword|keyword_generated|auto_bookmark)$/;
+      api.webNavigation.onCommitted.addListener(async (d) => {
+        try {
+          if (!d || d.frameId !== 0) return; // top frame only
+          const q = d.transitionQualifiers || [];
+          const userNav = USER_NAV.test(d.transitionType || '') || q.indexOf('from_address_bar') !== -1;
+          if (!userNav) return;
+          const st = await getState();
+          const gid = st.memb[d.tabId];
+          if (gid == null) return;
+          if (st.meta[gid] && st.meta[gid].mainTabId === d.tabId) return; // keep thread anchor
+          delete st.memb[d.tabId];
+          await save({ [K_MEMB]: st.memb });
+          console.log('[claude-zen][groups] pruned tab', d.tabId, 'on user navigation away from group', gid);
+        } catch {}
+      });
+    }
   }
 
   if (nativeGroups && chrome.tabGroups) {
@@ -967,7 +994,12 @@ if (!chrome.debugger) {
     // click off-target — e.g. (280,358) → (187,239) — and is reverted here.)
     const dpr = window.devicePixelRatio || 1; // diagnostics only — NOT applied to coords
     const x = p.x, y = p.y, m = p.modifiers || 0;
-    const el = document.elementFromPoint(x, y) || document.body;
+    // Split the null case from a legitimate <body> hit: elementFromPoint === null
+    // means the coords landed OUTSIDE the viewport / on no element at all — a real
+    // miss the caller must surface (otherwise the agent gets a false "Clicked").
+    const elAt = document.elementFromPoint(x, y);
+    const el = elAt || document.body;
+    const miss = !elAt;
     const button = { left: 0, middle: 1, right: 2, none: 0 }[p.button] ?? 0;
     let clickMeta = null;
     const base = {
@@ -1062,7 +1094,12 @@ if (!chrome.debugger) {
       if (t) s += ' "' + t.slice(0, 24) + '"';
       return s;
     };
-    return { dpr, x, y, hit: d(el), w: window.innerWidth, h: window.innerHeight, act: clickMeta };
+    // Is the resolved target inert (can't receive the click)? Surface it so the
+    // caller can report a real failure instead of a false "Clicked".
+    let disabled = false;
+    try { if (el && (el.disabled || (el.getAttribute && el.getAttribute('aria-disabled') === 'true'))) disabled = true; } catch {}
+    try { const cs = el && getComputedStyle(el); if (cs && cs.pointerEvents === 'none') disabled = true; } catch {}
+    return { dpr, x, y, hit: d(el), miss, disabled, w: window.innerWidth, h: window.innerHeight, act: clickMeta };
   };
 
   const __ffKey = (p) => {
@@ -1154,7 +1191,19 @@ if (!chrome.debugger) {
 
       case 'Input.dispatchMouseEvent': {
         const r = await __ffExec(tabId, __ffMouse, [params]);
-        if (r && typeof r === 'object') console.log('[claude-zen][cdp] mouse', params.type, 'raw=(' + params.x + ',' + params.y + ') dpr=' + r.dpr + ' css=(' + Math.round(r.x) + ',' + Math.round(r.y) + ') viewport=' + r.w + 'x' + r.h + ' hit=' + r.hit + (r.act ? ' [' + r.act + ']' : ''));
+        if (r && typeof r === 'object') console.log('[claude-zen][cdp] mouse', params.type, 'raw=(' + params.x + ',' + params.y + ') dpr=' + r.dpr + ' css=(' + Math.round(r.x) + ',' + Math.round(r.y) + ') viewport=' + r.w + 'x' + r.h + ' hit=' + r.hit + (r.miss ? ' MISS' : '') + (r.disabled ? ' DISABLED' : '') + (r.act ? ' [' + r.act + ']' : ''));
+        // Surface a REAL failure on the decisive release phase so the bundle reports
+        // an error to the model instead of a false "Clicked". CDP's real
+        // Input.dispatchMouseEvent rejects on failure; the bundle awaits sendCommand
+        // and propagates the rejection into the tool result. Gate conservatively on
+        // unambiguous misses only (coords hit no element, or the target is inert) —
+        // NOT on domMutations==0, which legitimately happens for nav/async renders.
+        if (params.type === 'mouseReleased' && r && typeof r === 'object' && (r.miss || r.disabled)) {
+          throw new Error(
+            'Firefox click had no effect at (' + params.x + ',' + params.y + '): ' +
+            (r.miss ? 'no element at those coordinates' : 'target is disabled/non-interactive (' + r.hit + ')') +
+            '. The element may be off-screen, covered, or the coordinates are wrong — re-screenshot and retry.');
+        }
         // (mouseReleased already waits ~160ms inside __ffMouse for the DOM to settle
         // before resolving, so the agent's next screenshot reflects the click.)
         return {};

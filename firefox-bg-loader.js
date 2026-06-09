@@ -186,8 +186,25 @@
       if (err)   return { success: false, error: `Auth failed: ${err}${errDesc ? ' - ' + errDesc : ''}` };
       if (!code) return { success: false, error: 'No authorization code received' };
 
-      const stored   = await chrome.storage.local.get(['codeVerifier']);
+      const stored   = await chrome.storage.local.get(['codeVerifier', 'oauthState']);
       const verifier = stored.codeVerifier || '';
+
+      // SECURITY: any script in the claude.ai MAIN world can postMessage an
+      // {type:'oauth_redirect'} through firefox-oauth-relay.js — the relay can't tell
+      // our bridge apart from arbitrary page JS (same origin). So before spending the
+      // stored PKCE verifier on a token exchange, prove the redirect belongs to a flow
+      // WE started:
+      //   1. codeVerifier present → a flow is actually in progress (blocks drive-by).
+      //   2. state matches the oauthState the bundle persisted at flow start
+      //      (PermissionManager writes {oauthState, codeVerifier} before redirecting) →
+      //      blocks CSRF / account-fixation where an attacker injects their own code.
+      if (!verifier) {
+        return { success: false, error: 'No OAuth flow in progress — ignoring redirect' };
+      }
+      if (stored.oauthState && state !== stored.oauthState) {
+        console.warn('[claude-zen] OAuth state mismatch — rejecting redirect (possible CSRF/fixation)');
+        return { success: false, error: 'OAuth state mismatch — redirect rejected' };
+      }
 
       const resp = await fetch(TOKEN_URL, {
         method:  'POST',
@@ -359,8 +376,21 @@ chrome.commands.onCommand.addListener((cmd) => {
     // headers (Chrome does not, which is why upstream never needed this).
     const strip = new Set(['origin', 'referer']);
 
+    // Only touch requests ORIGINATING FROM THE EXTENSION itself (sidepanel/background,
+    // origin moz-extension://<our-uuid>, or no tab). Without this gate the listener
+    // rewrites headers / strips Origin+Referer for EVERY site in the browser that hits
+    // api.anthropic.com — weakening Anthropic's CORS protection for third-party pages
+    // and spoofing their user-agent. Scope it to us. (tabId === -1 → background fetch.)
+    const selfPrefix = chrome.runtime.getURL('/'); // moz-extension://<uuid>/
+    const isOwnRequest = (details) => {
+      if (details.tabId === -1) return true;
+      const from = details.originUrl || details.documentUrl || '';
+      return from.indexOf(selfPrefix) === 0;
+    };
+
     chrome.webRequest.onBeforeSendHeaders.addListener(
       (details) => {
+        if (!isOwnRequest(details)) return {}; // leave third-party site requests untouched
         let headers = (details.requestHeaders || []).filter(
           (h) => !strip.has(h.name.toLowerCase())
         );
