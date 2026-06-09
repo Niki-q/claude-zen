@@ -40,7 +40,18 @@
     'dragstart', 'drop', 'submit',
   ];
 
+  // Blocking has TWO independent sources, OR'd together:
+  //   sessionOn — the bundle's SHOW/HIDE_*_INDICATOR messages (whole session).
+  //   ttlOn     — a heartbeat from our CDP shim: every synthetic input it dispatches
+  //               to this tab refreshes a short TTL. This is the RELIABLE source — it
+  //               fires exactly when Claude acts on the page, even if the bundle's
+  //               indicator messages never reach this content script in Firefox
+  //               (which is why "запрет не работает" — the session path can be silent).
   let active = false;
+  let sessionOn = false;
+  let ttlOn = false;
+  let ttlTimer = null;
+  let curKind = 'agent';
 
   // Controls the user must always be able to click while blocking is on:
   //   #claude-agent-stop-container       — the bundle's stop button (pulsing/main tab)
@@ -79,7 +90,10 @@
   };
   const removeStop = () => { if (stopBtn) { try { stopBtn.remove(); } catch (e) {} stopBtn = null; } };
 
-  const setActive = (on, kind) => {
+  // Recompute the effective blocking state from both sources and (un)install listeners.
+  const apply = (kind) => {
+    if (kind) curKind = kind;
+    const on = sessionOn || ttlOn;
     if (on !== active) {
       active = on;
       for (const type of BLOCKED) {
@@ -91,7 +105,18 @@
     // Only driven ("static") tabs lack a native stop button — inject ours there. On the
     // main ("pulsing") tab the bundle injects #claude-agent-stop-container itself; let it
     // (ensureStop also bails if that container is present, guarding the race either way).
-    if (kind === 'static') setTimeout(ensureStop, 150);
+    if (curKind === 'static') setTimeout(ensureStop, 150);
+  };
+
+  // CDP heartbeat: Claude just dispatched input to THIS tab → block for a window,
+  // refreshed by each subsequent action. Generous TTL so brief "thinking" gaps between
+  // actions stay blocked; when the session truly ends the input stops and it lapses.
+  const TTL_MS = 8000;
+  const heartbeat = () => {
+    ttlOn = true;
+    if (ttlTimer) clearTimeout(ttlTimer);
+    ttlTimer = setTimeout(() => { ttlTimer = null; ttlOn = false; apply(); }, TTL_MS);
+    apply('static');
   };
 
   chrome.runtime.onMessage.addListener((msg) => {
@@ -99,11 +124,12 @@
     // "pulsing" (main tab) → SHOW_AGENT_INDICATORS; "static" (driven tabs) →
     // SHOW_STATIC_INDICATOR. BOTH mean the agent session is active on this tab, so
     // block real user input in either state. "none" → HIDE_AGENT_INDICATORS.
-    if (msg.type === 'SHOW_AGENT_INDICATORS') setActive(true, 'agent');
-    else if (msg.type === 'SHOW_STATIC_INDICATOR') setActive(true, 'static');
-    else if (msg.type === 'HIDE_AGENT_INDICATORS' || msg.type === 'HIDE_STATIC_INDICATOR') setActive(false);
+    if (msg.type === 'SHOW_AGENT_INDICATORS') { sessionOn = true; apply('agent'); }
+    else if (msg.type === 'SHOW_STATIC_INDICATOR') { sessionOn = true; apply('static'); }
+    else if (msg.type === 'HIDE_AGENT_INDICATORS' || msg.type === 'HIDE_STATIC_INDICATOR') { sessionOn = false; apply(); }
+    else if (msg.type === '__FF_AGENT_ACTIVE') heartbeat(); // from firefox-page-shims CDP shim
     // do not return true / sendResponse — the indicator script owns the reply
   });
 
-  window.addEventListener('pagehide', () => setActive(false));
+  window.addEventListener('pagehide', () => { sessionOn = false; ttlOn = false; if (ttlTimer) clearTimeout(ttlTimer); apply(); });
 })();

@@ -211,10 +211,18 @@
         let open = true;
         try { if (api.sidebarAction.isOpen) open = await api.sidebarAction.isOpen({}); } catch (e) {}
         if (!open) return;                                  // nothing to close
-        if (tabId === await sidebarPinnedTab()) return;      // the sidebar's own tab — keep
-        const t = await threadForTab(tabId);
-        if (t) return;                                       // a Claude thread tab — keep
-        try { await api.sidebarAction.close(); } catch (e) {} // foreign tab — close (best-effort)
+        const pinned = await sidebarPinnedTab();
+        if (tabId === pinned) return;                        // the sidebar's own tab — keep
+        // Keep the sidebar open ONLY for tabs in the SAME thread/group it is pinned to —
+        // not for any Claude thread. The sidebar shows ONE conversation (pinned tab), so
+        // showing it over a DIFFERENT thread's tab is misleading. Switching threads is the
+        // switcher's job, not "stay open everywhere Claude has a tab".
+        const cur = await threadForTab(tabId);
+        if (cur) {
+          const pin = pinned != null ? await threadForTab(pinned) : null;
+          if (pin && cur.groupId === pin.groupId) return;    // same thread as pinned — keep
+        }
+        try { await api.sidebarAction.close(); } catch (e) {} // other tab/window/thread — close
       } catch (e) {}
     };
     if (api.tabs && api.tabs.onActivated) {

@@ -982,6 +982,17 @@ if (!chrome.debugger) {
     return res && res[0] ? res[0].result : undefined;
   };
 
+  // Tell the tab's input-blocker (firefox-input-blocker.js) that Claude is acting on it
+  // RIGHT NOW, so it blocks real user input even when the bundle's SHOW_*_INDICATOR
+  // messages don't reach the content script in Firefox. Fire-and-forget.
+  const __ffSignalActive = (tabId) => {
+    if (tabId == null) return;
+    try {
+      const p = __ffApi.tabs.sendMessage(tabId, { type: '__FF_AGENT_ACTIVE' });
+      if (p && p.catch) p.catch(() => {});
+    } catch {}
+  };
+
   // ── Injected page-world helpers (self-contained — serialized by executeScript) ──
   const __ffMouse = async (p) => {
     // Coordinate space: tabs.captureVisibleTab (our Page.captureScreenshot) returns
@@ -1190,6 +1201,7 @@ if (!chrome.debugger) {
       }
 
       case 'Input.dispatchMouseEvent': {
+        __ffSignalActive(tabId);
         const r = await __ffExec(tabId, __ffMouse, [params]);
         if (r && typeof r === 'object') console.log('[claude-zen][cdp] mouse', params.type, 'raw=(' + params.x + ',' + params.y + ') dpr=' + r.dpr + ' css=(' + Math.round(r.x) + ',' + Math.round(r.y) + ') viewport=' + r.w + 'x' + r.h + ' hit=' + r.hit + (r.miss ? ' MISS' : '') + (r.disabled ? ' DISABLED' : '') + (r.act ? ' [' + r.act + ']' : ''));
         // Surface a REAL failure on the decisive release phase so the bundle reports
@@ -1209,11 +1221,13 @@ if (!chrome.debugger) {
         return {};
       }
       case 'Input.dispatchKeyEvent': {
+        __ffSignalActive(tabId);
         const r = await __ffExec(tabId, __ffKey, [params]);
         console.log('[claude-zen][cdp] key', params.type, 'key=' + JSON.stringify(params.key) + ' active=' + (r && r.active));
         return {};
       }
       case 'Input.insertText': {
+        __ffSignalActive(tabId);
         const r = await __ffExec(tabId, __ffInsertText, [params.text]);
         console.log('[claude-zen][cdp] insertText ' + JSON.stringify(String(params.text).slice(0, 30)) + ' result=' + JSON.stringify(r));
         return {};
