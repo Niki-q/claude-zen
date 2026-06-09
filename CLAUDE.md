@@ -303,6 +303,33 @@ merged across the background + sidepanel contexts), defined in `firefox-page-shi
 The `[cdp]` action entries are kept **always** (cheap, decisive for click debugging);
 thinking/chat content is only persisted while the mirror is enabled (privacy/size).
 
+### Previous chats (conversation history that survives close/restart)
+
+The upstream bundle keeps the agent conversation **only in volatile React state**
+(`messages:[]`, `sessionId:null`) — it makes **zero** `storage.set` calls and has no
+server-side resume for the extension agent, so closing the sidebar (or restarting)
+destroys the chat. To give "access to previous chats", a **capture + persistence layer**
+was added (layers 1–2; "continue a past chat" is a separate, pending decision):
+
+- **Capture (`firefox-page-shims.js`, always-on)**: the existing `window.fetch` wrapper
+  tees `/v1/messages` calls. Each **request body carries the full `messages` array**, so a
+  sanitized snapshot (base64 images dropped, blocks truncated) is persisted to
+  `storage.local.__czChats` keyed by a `chatId`. The chatId **rotates** when the first user
+  message changes (a "new chat") — tracked via `storage.session.__czChatCur`
+  (`tabId → chatId`). `czCaptureResponse` also appends the streamed assistant reply (the
+  one part the next request won't yet contain). Capture only runs in the sidepanel (it
+  needs the `?tabId=N` to attribute the chat).
+- **Recent list + read-only viewer (`firefox-threads.js`)**: the switcher menu now has a
+  **"Recent chats"** section (read from `__czChats`, newest first) that is shown **even
+  with no open threads** (the post-restart case). A row opens a full-screen **read-only
+  transcript viewer** (rendered via `self.czRenderChatMd`); 🗑 deletes a saved chat.
+- **Console helpers**: `czChats()` (list), `czChatExport(id)` (download `.md`),
+  `czChatDelete(id)`.
+- **Not yet done — "continue" a past chat**: re-injecting history into the live bundle so
+  the agent keeps context. Two candidate approaches were scoped (hook the bundle's Zustand
+  store = seamless but fragile vs. re-seed via the public `EXECUTE_TASK` = robust but a new
+  session) — decision pending.
+
 ## Known Constraints / Gotchas
 
 ### Host Permissions (Optional in Firefox MV3)
@@ -358,6 +385,8 @@ Native Firefox `chrome.tabs.group` (FF 139+) **rejects privileged/extension page
 - `__czDebugMirror`: boolean — enables the chat→console debug mirror (see Debug Mode)
 - `__czSessionLog`: array — persistent ring-buffer debug log (see Debug Mode → Persistent session log); dump with `czDumpLog()`
 - `__czPreferEmulatedGroups`: boolean — manual override for grouping mode (`true`=force registry-only/emulated, `false`=force native, unset=auto-detect Zen). Set via `czEmulateGroups(true/false)`. See `docs/ZEN_TABS_AND_FOLDERS.md`
+- `__czChats`: object (storage.local) — saved chat transcripts keyed by chatId (see Previous chats); the bundle never persists conversations, so the capture layer does
+- `__czChatCur`: object (storage.session) — `tabId → current chatId` map for the capture rotation
 
 ### Extension IDs
 

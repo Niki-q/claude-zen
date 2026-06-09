@@ -264,7 +264,53 @@
     const ready = (fn) => { if (document.body) fn(); else document.addEventListener('DOMContentLoaded', fn, { once: true }); };
     ready(() => {
       let threads = [];
+      let recents = [];
       let listOpen = false;
+      const localStore = api.storage && api.storage.local;
+
+      // Saved chats (firefox-page-shims capture → storage.local.__czChats), newest first.
+      const loadRecents = async () => {
+        try {
+          const o = localStore && await localStore.get('__czChats');
+          const c = (o && o.__czChats) || {};
+          return Object.values(c).sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0)).slice(0, 25);
+        } catch (e) { return []; }
+      };
+
+      // ── Read-only transcript viewer ──────────────────────────────────────────
+      const viewer = document.createElement('div');
+      viewer.id = 'cz-chat-viewer';
+      viewer.style.cssText = [
+        'position:fixed', 'inset:0', 'z-index:2147483647', 'display:none',
+        'background:Canvas', 'color:CanvasText', 'overflow:auto', 'padding:0',
+        'font:13px/1.5 system-ui,-apple-system,sans-serif',
+      ].join(';');
+      const viewerBar = document.createElement('div');
+      viewerBar.style.cssText = 'position:sticky;top:0;display:flex;align-items:center;gap:8px;padding:8px 12px;background:Canvas;border-bottom:1px solid rgba(127,127,127,.3);';
+      const viewerBack = document.createElement('button');
+      viewerBack.textContent = '← Back'; viewerBack.type = 'button';
+      viewerBack.style.cssText = 'border:1px solid rgba(127,127,127,.4);background:transparent;color:inherit;border-radius:6px;padding:4px 10px;cursor:pointer';
+      const viewerTitle = document.createElement('div');
+      viewerTitle.style.cssText = 'flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:600';
+      const viewerExport = document.createElement('button');
+      viewerExport.textContent = '⬇ .md'; viewerExport.type = 'button'; viewerExport.title = 'Export transcript';
+      viewerExport.style.cssText = viewerBack.style.cssText;
+      viewerBar.appendChild(viewerBack); viewerBar.appendChild(viewerTitle); viewerBar.appendChild(viewerExport);
+      const viewerBody = document.createElement('div');
+      viewerBody.style.cssText = 'padding:12px;white-space:pre-wrap;word-break:break-word';
+      viewer.appendChild(viewerBar); viewer.appendChild(viewerBody);
+      document.body.appendChild(viewer);
+      viewerBack.onclick = () => { viewer.style.display = 'none'; };
+      const openViewer = (chat) => {
+        viewerTitle.textContent = chat.title || 'Chat';
+        // Reuse the markdown renderer from firefox-page-shims; show as preformatted text.
+        viewerBody.textContent = (typeof self.czRenderChatMd === 'function')
+          ? self.czRenderChatMd(chat)
+          : JSON.stringify(chat.messages || [], null, 2);
+        viewerExport.onclick = () => { try { if (self.czChatExport) self.czChatExport(chat.id); } catch (e) {} };
+        viewer.style.display = 'block';
+        viewer.scrollTop = 0;
+      };
 
       const curTabId = () => {
         const v = new URLSearchParams(location.search).get('tabId');
@@ -360,9 +406,8 @@
         if (!threads.length) {
           const empty = document.createElement('div');
           empty.style.cssText = 'padding:10px 12px;opacity:.7';
-          empty.textContent = 'No Claude threads yet';
+          empty.textContent = 'No open Claude threads';
           menu.appendChild(empty);
-          return;
         }
         threads.forEach((t) => {
           const active = (t.mainTabId === cur) || (t.tabIds.indexOf(cur) !== -1);
@@ -400,6 +445,37 @@
           row.onclick = () => { closeMenu(); if (t.mainTabId !== cur) repoint(t.mainTabId); };
           menu.appendChild(row);
         });
+
+        // ── Recent (saved) chats — survive sidebar close + restart ──────────────
+        // Read-only history for now (layer 1–2). "Continue" is a later decision.
+        if (recents.length) {
+          const hdr = document.createElement('div');
+          hdr.style.cssText = 'padding:8px 12px 4px;opacity:.55;font-size:11px;text-transform:uppercase;letter-spacing:.04em;border-top:1px solid rgba(127,127,127,.2)';
+          hdr.textContent = 'Recent chats';
+          menu.appendChild(hdr);
+          recents.forEach((chat) => {
+            const row = document.createElement('div');
+            row.style.cssText = 'display:flex;align-items:center;gap:8px;padding:8px 12px;border-bottom:1px solid rgba(127,127,127,.12);cursor:pointer';
+            row.onmouseenter = () => { row.style.background = 'rgba(127,127,127,.10)'; };
+            row.onmouseleave = () => { row.style.background = ''; };
+            const txt = document.createElement('div');
+            txt.style.cssText = 'flex:1;min-width:0';
+            const ln1 = document.createElement('div');
+            ln1.style.cssText = 'overflow:hidden;text-overflow:ellipsis;white-space:nowrap';
+            ln1.textContent = chat.title || 'Untitled chat';
+            const ln2 = document.createElement('div');
+            ln2.style.cssText = 'overflow:hidden;text-overflow:ellipsis;white-space:nowrap;opacity:.55;font-size:11px';
+            ln2.textContent = (chat.turns || 0) + ' msgs · ' + new Date(chat.updatedAt || Date.now()).toLocaleString();
+            txt.appendChild(ln1); txt.appendChild(ln2);
+            const del = document.createElement('button');
+            del.type = 'button'; del.textContent = '🗑'; del.title = 'Delete saved chat';
+            del.style.cssText = 'flex:none;border:none;background:transparent;color:inherit;opacity:.5;cursor:pointer;font:12px/1 system-ui';
+            del.onclick = (e) => { e.stopPropagation(); try { if (self.czChatDelete) self.czChatDelete(chat.id); } catch (err) {} recents = recents.filter((c) => c.id !== chat.id); renderMenu(); };
+            row.appendChild(txt); row.appendChild(del);
+            row.onclick = () => { openViewer(chat); };
+            menu.appendChild(row);
+          });
+        }
       };
 
       const openMenu = () => { listOpen = true; caret.textContent = '▴'; menu.style.display = 'block'; renderMenu(); };
@@ -407,6 +483,7 @@
 
       const refresh = async () => {
         try { threads = await getThreads(); } catch (e) { threads = []; }
+        try { recents = await loadRecents(); } catch (e) { recents = []; }
         // Always visible — the pill hosts the "+ New thread" button even with 0–1 threads.
         pill.style.display = 'flex';
         renderLabel();
@@ -418,8 +495,8 @@
         if (listOpen && !menu.contains(e.target) && !pill.contains(e.target)) closeMenu();
       });
 
-      // Live updates when Claude creates/changes groups.
-      try { api.storage.onChanged.addListener((ch) => { if (ch && (ch[K_META] || ch[K_MEMB])) refresh(); }); } catch (e) {}
+      // Live updates when Claude creates/changes groups or saves a chat.
+      try { api.storage.onChanged.addListener((ch) => { if (ch && (ch[K_META] || ch[K_MEMB] || ch.__czChats)) refresh(); }); } catch (e) {}
       // In-page "jump to thread" → repoint this sidebar.
       try {
         api.runtime.onMessage.addListener((msg) => {

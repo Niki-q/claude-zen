@@ -74,12 +74,23 @@ if (typeof window !== 'undefined' && typeof window.fetch === 'function') {
     if (_czIsMessages && self.__czDebug && self.__czDebug.enabled) {
       try { self.__czDebug.logRequest(input, init); } catch {}
     }
+    // Conversation capture (ALWAYS on): persist the full transcript per chat so it
+    // survives sidebar close / restart. The request body carries the entire messages
+    // array each turn, so this snapshot is the whole conversation up to the last user turn.
+    if (_czIsMessages && self.czCaptureRequest) {
+      try { self.czCaptureRequest(input, init); } catch {}
+    }
 
     const resp = await _origFetch.call(this, input, init);
 
     // Debug mirror (opt-in): tee the SSE response → console (non-destructive).
     if (_czIsMessages && self.__czDebug && self.__czDebug.enabled) {
       try { self.__czDebug.tee(resp); } catch {}
+    }
+    // Conversation capture: also grab the assistant's reply (the one part the next
+    // request won't have yet) from the streamed response, non-destructively.
+    if (_czIsMessages && self.czCaptureResponse) {
+      try { self.czCaptureResponse(resp); } catch {}
     }
     try {
       if (url.includes('api.anthropic.com') && (resp.status === 401 || resp.status === 403)) {
@@ -90,6 +101,194 @@ if (typeof window !== 'undefined' && typeof window.fetch === 'function') {
     return resp;
   };
 }
+
+// ── Conversation capture & persistence (previous-chats, layer 1) ──────────────
+// Persists the chat transcript per conversation to storage.local.__czChats so it
+// survives the sidebar closing AND a browser restart (the bundle keeps messages only
+// in volatile React state and never persists them — verified). Capture is non-
+// destructive (request body is read from init.body or a Request clone; the response
+// is read via resp.clone()). Runs only where a sidepanel ?tabId=N is present (that's
+// where the chat fetches originate and where we can attribute them to a thread).
+//   self.czChats()         — list saved chats {id,title,turns,updatedAt}
+//   self.czChatExport(id)  — download one chat as a .md transcript
+//   self.czChatDelete(id)  — remove a saved chat
+// Read by firefox-threads.js to populate the switcher's "Recent" section.
+(function () {
+  const api = (typeof browser !== 'undefined' ? browser : chrome);
+  const store = (api && api.storage && api.storage.local) || null;
+  const sess  = (api && api.storage && (api.storage.session || api.storage.local)) || null;
+  const KEY = '__czChats';
+  const CURKEY = '__czChatCur';      // session map: tabId → current chatId
+  const CAP_CHATS = 60;              // max saved chats
+  const MAX_BLOCK = 20000;          // truncate any single text/tool block
+
+  // Resolved lazily at capture time — the sidepanel's ?tabId=N is injected by the
+  // deferred-module loader slightly AFTER this script runs, so reading it now would be
+  // null and would wrongly disable the whole module (incl. czRenderChatMd, used by the
+  // viewer). Only contexts bound to a tabId (the sidepanel) actually capture.
+  const curTabId = () => {
+    try { const v = new URLSearchParams(location.search).get('tabId'); return (v != null && v !== '') ? v : null; }
+    catch { return null; }
+  };
+  if (!store) return;
+
+  const trunc = (s) => { s = String(s == null ? '' : s); return s.length > MAX_BLOCK ? s.slice(0, MAX_BLOCK) + `… [+${s.length - MAX_BLOCK}]` : s; };
+  // Strip heavy/base64 image data so storage stays small; keep text + tool shapes.
+  const sanitize = (messages) => {
+    try {
+      return messages.map((m) => {
+        const role = m.role || 'user';
+        let content = m.content;
+        if (typeof content === 'string') return { role, content: trunc(content) };
+        if (!Array.isArray(content)) return { role, content: '' };
+        const blocks = content.map((c) => {
+          if (!c || !c.type) return null;
+          if (c.type === 'text') return { type: 'text', text: trunc(c.text) };
+          if (c.type === 'thinking') return { type: 'thinking', text: trunc(c.thinking || c.text || '') };
+          if (c.type === 'image') return { type: 'image' };
+          if (c.type === 'tool_use') return { type: 'tool_use', name: c.name, input: c.input };
+          if (c.type === 'tool_result') {
+            let body = c.content;
+            if (Array.isArray(body)) body = body.map((x) => x && x.type === 'text' ? x.text : x && x.type === 'image' ? '[image]' : `[${(x && x.type) || '?'}]`).join('\n');
+            return { type: 'tool_result', is_error: !!c.is_error, content: trunc(body) };
+          }
+          return { type: c.type };
+        }).filter(Boolean);
+        return { role, content: blocks };
+      });
+    } catch { return []; }
+  };
+
+  // First-user-message signature → decide whether a request continues the current chat
+  // or starts a new one (the bundle's "new chat" clears messages, so messages[0] changes).
+  const firstSig = (messages) => {
+    const m = messages.find((x) => x.role === 'user') || messages[0];
+    if (!m) return '';
+    let t = m.content;
+    if (Array.isArray(t)) t = t.map((c) => c && c.type === 'text' ? c.text : '').join(' ');
+    return String(t || '').trim().slice(0, 120);
+  };
+  const titleOf = (messages) => {
+    const sig = firstSig(messages);
+    return sig ? sig.replace(/\s+/g, ' ').slice(0, 80) : 'Untitled chat';
+  };
+
+  let writeChain = Promise.resolve();
+  const persist = (requestObj) => {
+    writeChain = writeChain.then(async () => {
+      const activeTab = curTabId();
+      if (activeTab == null) return; // not a tab-bound context (e.g. background) — skip
+      const messages = sanitize(requestObj.messages || []);
+      if (!messages.length) return;
+      const sig = firstSig(requestObj.messages || []);
+      let curMap = {};
+      try { const o = sess && await sess.get(CURKEY); curMap = (o && o[CURKEY]) || {}; } catch {}
+      let chatId = curMap[activeTab];
+
+      const o = await store.get(KEY);
+      const chats = (o && o[KEY]) || {};
+      // Rotate to a new chat if none active, the active one is gone, or the first
+      // message changed (a "new chat" was started in this tab).
+      if (!chatId || !chats[chatId] || (chats[chatId].sig && sig && chats[chatId].sig !== sig)) {
+        chatId = 'c' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+        curMap[activeTab] = chatId;
+        try { if (sess) await sess.set({ [CURKEY]: curMap }); } catch {}
+      }
+      const now = Date.now();
+      const prev = chats[chatId];
+      chats[chatId] = {
+        id: chatId, tabId: activeTab, sig,
+        title: titleOf(requestObj.messages || []),
+        model: requestObj.model || (prev && prev.model) || '',
+        messages,
+        turns: messages.length,
+        createdAt: (prev && prev.createdAt) || now,
+        updatedAt: now,
+        lastReply: prev && prev.lastReply, // filled by czCaptureResponse
+      };
+      // Evict oldest beyond cap.
+      const ids = Object.keys(chats);
+      if (ids.length > CAP_CHATS) {
+        ids.sort((a, b) => (chats[a].updatedAt || 0) - (chats[b].updatedAt || 0));
+        for (let i = 0; i < ids.length - CAP_CHATS; i++) delete chats[ids[i]];
+      }
+      self.__czCurChatId = chatId;
+      await store.set({ [KEY]: chats });
+    }).catch(() => {});
+  };
+
+  self.czCaptureRequest = (input, init) => {
+    const body = init && init.body;
+    if (typeof body === 'string') { try { const o = JSON.parse(body); if (o && Array.isArray(o.messages)) persist(o); } catch {} return; }
+    if (input && typeof input.clone === 'function') {
+      input.clone().text().then((s) => { try { const o = JSON.parse(s); if (o && Array.isArray(o.messages)) persist(o); } catch {} }).catch(() => {});
+    }
+  };
+
+  // Append the streamed assistant reply (the part the next request body won't include
+  // until the turn after). Parsed from a clone; best-effort, text only.
+  self.czCaptureResponse = (resp) => {
+    try {
+      const ct = (resp.headers && resp.headers.get('content-type')) || '';
+      if (!resp.body || !/event-stream/.test(ct)) return;
+      (async () => {
+        const reader = resp.clone().body.getReader();
+        const dec = new TextDecoder();
+        let buf = '', text = '';
+        for (;;) {
+          const { value, done } = await reader.read(); if (done) break;
+          buf += dec.decode(value, { stream: true });
+          let i;
+          while ((i = buf.indexOf('\n\n')) >= 0) {
+            const raw = buf.slice(0, i); buf = buf.slice(i + 2);
+            let data = ''; for (const ln of raw.split('\n')) if (ln.startsWith('data:')) data += ln.slice(5).trim();
+            if (!data || data === '[DONE]') continue;
+            let ev; try { ev = JSON.parse(data); } catch { continue; }
+            if (ev.type === 'content_block_delta' && ev.delta) { if (ev.delta.type === 'text_delta') text += ev.delta.text || ''; }
+          }
+        }
+        if (!text) return;
+        const cid = self.__czCurChatId;
+        if (!cid) return;
+        const o = await store.get(KEY); const chats = (o && o[KEY]) || {};
+        if (chats[cid]) { chats[cid].lastReply = trunc(text); chats[cid].updatedAt = Date.now(); await store.set({ [KEY]: chats }); }
+      })().catch(() => {});
+    } catch {}
+  };
+
+  // Render a saved chat as markdown (used by export + the read-only viewer).
+  self.czRenderChatMd = (chat) => {
+    const out = ['# ' + (chat.title || 'Chat'), '', '_' + new Date(chat.createdAt || Date.now()).toLocaleString() + (chat.model ? ' · ' + chat.model : '') + '_', ''];
+    for (const m of (chat.messages || [])) {
+      out.push(m.role === 'user' ? '### 👤 User' : '### 🤖 Assistant');
+      if (typeof m.content === 'string') out.push(m.content);
+      else for (const b of (m.content || [])) {
+        if (b.type === 'text') out.push(b.text || '');
+        else if (b.type === 'thinking') out.push('> 💭 ' + String(b.text || '').replace(/\n/g, '\n> '));
+        else if (b.type === 'tool_use') out.push('🔧 **' + (b.name || 'tool') + '**\n```json\n' + JSON.stringify(b.input || {}, null, 2) + '\n```');
+        else if (b.type === 'tool_result') out.push('✅ tool_result' + (b.is_error ? ' [error]' : '') + '\n```\n' + (b.content || '') + '\n```');
+        else if (b.type === 'image') out.push('_[image]_');
+      }
+      out.push('');
+    }
+    if (chat.lastReply) out.push('### 🤖 Assistant (final)', chat.lastReply, '');
+    return out.join('\n');
+  };
+
+  // Console helpers.
+  self.czChats = async () => { const o = await store.get(KEY); const c = (o && o[KEY]) || {}; return Object.values(c).sort((a, b) => b.updatedAt - a.updatedAt).map((x) => ({ id: x.id, title: x.title, turns: x.turns, updated: new Date(x.updatedAt).toLocaleString() })); };
+  self.czChatExport = async (id) => {
+    const o = await store.get(KEY); const c = (o && o[KEY]) || {}; const chat = c[id] || (await self.czChats())[0] && c[(await self.czChats())[0].id];
+    if (!chat) return 'no such chat';
+    const md = self.czRenderChatMd ? self.czRenderChatMd(chat) : JSON.stringify(chat, null, 2);
+    const urlB = URL.createObjectURL(new Blob([md], { type: 'text/markdown' }));
+    const fn = 'claude-chat-' + (chat.title || id).replace(/[^\w]+/g, '-').slice(0, 40) + '.md';
+    try { if (api.downloads) await api.downloads.download({ url: urlB, filename: fn, saveAs: true }); } catch {}
+    setTimeout(() => URL.revokeObjectURL(urlB), 60000);
+    return 'exported ' + fn;
+  };
+  self.czChatDelete = async (id) => { const o = await store.get(KEY); const c = (o && o[KEY]) || {}; delete c[id]; await store.set({ [KEY]: c }); return 'deleted'; };
+})();
 
 // ── Debug mirror: tee the chat to the console ─────────────────────────────────
 // Optional dev aid. When enabled, mirrors everything that flows through the chat
