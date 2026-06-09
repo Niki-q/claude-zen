@@ -161,12 +161,17 @@ Hand-written classic (non-module) scripts that are loaded **before** the bundle 
 
 **Implementation**:
 - Listens for broadcast messages:
-  - `SHOW_AGENT_INDICATORS` → agent started → block input
-  - `HIDE_AGENT_INDICATORS` → agent finished → unblock input
+  - `SHOW_AGENT_INDICATORS` / `SHOW_STATIC_INDICATOR` → agent active on this tab → block input
+  - `HIDE_AGENT_INDICATORS` / `HIDE_STATIC_INDICATOR` → agent finished → unblock input
+  - `__FF_AGENT_ACTIVE` → **CDP heartbeat** (see below)
+- **Two blocking sources, OR'd** (`sessionOn || ttlOn`):
+  - **session** — the bundle's `SHOW/HIDE_*_INDICATOR` messages (whole session). In Firefox these sometimes never reach the content script, so on their own the page stayed clickable ("запрет не работает").
+  - **heartbeat (reliable)** — the CDP shim (`firefox-page-shims.js` `__ffSignalActive`) fires `__FF_AGENT_ACTIVE` at the tab on **every** synthetic mouse/key/text dispatch; the blocker then blocks for a refreshed ~8s TTL. This ties blocking to *actual* automation, independent of the indicator messages.
 - Registers capture-phase listeners on a set of input events (`click`, `keydown`, `mousedown`, etc.)
 - **Gate**: only blocks if `event.isTrusted === true` (real user input)
   - Synthetic events (dispatched by the debugger CDP shim via `executeScript`) have `isTrusted === false` → allowed through
-- **Exceptions**: events targeting `#claude-agent-stop-container` are always allowed (user can stop the agent)
+- **Exceptions**: events whose target is inside `#claude-agent-stop-container`, `#claude-static-indicator-container`, or our injected `#__cz_stop_btn` are always allowed (user can stop the agent / use indicator controls)
+- **Injected Stop button (`#__cz_stop_btn`)**: driven ("static") tabs get no native stop button, so the blocker injects one. On click it resolves the session's **main tab via our registry** (`FF_RESOLVE_MAIN_TAB` → `firefox-threads.js`) and sends `STOP_AGENT` with that **numeric** `fromTabId` — bypassing the bundle's own `getMainTabId`, which can miss the mapping and then never abort. Falls back to the `CURRENT_TAB` sentinel if resolution fails.
 
 **Why capture phase?** The automation uses `document.elementFromPoint(x, y)` to find targets. A real overlay (`pointer-events: auto`) would be returned by `elementFromPoint` and Claude would "click" the overlay instead of the page.
 
@@ -278,6 +283,26 @@ czDebug(false)   // disable
 ```
 State persists in `storage.local.__czDebugMirror` and propagates across contexts via `storage.onChanged` (toggling in the background console also enables it in the sidepanel). Long text/args/results are truncated to ~4000 chars; images are shown as `[image]`.
 
+### Persistent session log (save to computer for later debugging)
+
+The chat mirror only prints to the live console. For **post-mortem** debugging of
+"Claude thinks it clicked but nothing happened" / stop-not-working runs, there is a
+ring-buffer log persisted to `storage.local.__czSessionLog` (capped ~4000 entries,
+merged across the background + sidepanel contexts), defined in `firefox-page-shims.js`:
+
+- **`self.czLog(category, text)`** — append an entry. Wired up so that **every** `[cdp]`
+  click/key/insertText result (including `miss` / `disabled` / `domMutations` /
+  `reachedDoc` / `defaultPrevented` and `CLICK-FAILED` lines) is recorded automatically,
+  and — **when `czDebug()` is on** — the assistant's thinking, tool calls, and tool
+  results too (the chat-mirror `log()` tees into it).
+- **`czDumpLog()`** — flush + download the whole log as a timestamped `.log` file via the
+  `downloads` API (this is the "save sessions on the computer" hook). Run it from the
+  sidepanel or background console after reproducing a bug.
+- **`czClearLog()`** — wipe the buffer.
+
+The `[cdp]` action entries are kept **always** (cheap, decisive for click debugging);
+thinking/chat content is only persisted while the mirror is enabled (privacy/size).
+
 ## Known Constraints / Gotchas
 
 ### Host Permissions (Optional in Firefox MV3)
@@ -331,6 +356,7 @@ Native Firefox `chrome.tabs.group` (FF 139+) **rejects privileged/extension page
 - `accountUuid`: user's account UUID
 - `lastAuthFailureReason`: diagnostic
 - `__czDebugMirror`: boolean — enables the chat→console debug mirror (see Debug Mode)
+- `__czSessionLog`: array — persistent ring-buffer debug log (see Debug Mode → Persistent session log); dump with `czDumpLog()`
 
 ### Extension IDs
 
@@ -383,9 +409,20 @@ the sidebar shows. A **"thread" = one Claude group** in the registry
   loader for that thread (browser tabs are left untouched). Each row has a **⤴ "jump to
   tab"** button that focuses that thread's browser tab. Refreshes on `storage.onChanged`.
 - **Background handlers** (`runtime.onMessage`, `FF_*`): `FF_THREAD_MEMBERSHIP` (is this
-  tab in a Claude group?), `FF_FOCUS_TAB` (`tabs.update`+`windows.update`), and
+  tab in a Claude group?), `FF_RESOLVE_MAIN_TAB` (registry → the session's main tab, used
+  by the input-blocker's Stop button), `FF_FOCUS_TAB` (`tabs.update`+`windows.update`), and
   `FF_JUMP_TO_THREAD` (resolve the tab's thread → broadcast `FF_SWITCH_THREAD` so the open
   sidebar repoints; uses `sidebarAction.isOpen()` to tell the page whether it landed).
+  `FF_FOCUS_TAB` / `FF_NEW_THREAD` act on a caller-supplied `tabId`, so they are **gated to
+  extension-page senders** (sidepanel) — a content script / web page can't drive the
+  user's tabs through them.
+- **Sidebar scoping** (`closeSidebarIfForeign`, on `tabs.onActivated` /
+  `windows.onFocusChanged`): Firefox's sidebar is one **global** instance shown on every
+  tab/window. To keep it from lingering on unrelated pages, it is **closed** whenever the
+  active tab is neither the sidebar's **pinned tab** (`storage.session.__ffSidebarTab`) nor
+  a tab in the **same thread/group** as that pinned tab. It is **not** auto-reopened
+  (Firefox needs a live user gesture) — the user reopens with Ctrl+E. So the sidebar stays
+  "where you opened it / its own tab group" and disappears elsewhere.
 - **Content-script registration** — registers `firefox-thread-jump.js` dynamically via
   `scripting.registerContentScripts` (id `cz-thread-jump`), so no manifest
   `content_scripts` edit is needed.

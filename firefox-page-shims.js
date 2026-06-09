@@ -123,6 +123,7 @@ if (typeof window !== 'undefined' && typeof window.fetch === 'function') {
   };
   const log = (kind, msg) => {
     try { console.log(`%c[claude-zen][chat] ${msg}`, C[kind] || C.meta); } catch {}
+    try { if (self.czLog) self.czLog(kind, msg); } catch {} // persist for later debugging
   };
   const banner = () => log('meta', 'chat mirror enabled — thoughts, tool calls & results will print here');
 
@@ -254,6 +255,66 @@ if (typeof window !== 'undefined' && typeof window.fetch === 'function') {
       if (area === 'local' && ch && ch[FLAG]) { enabled = !!ch[FLAG].newValue; if (enabled) banner(); }
     });
   } catch {}
+})();
+
+// ── Persistent session log (save to computer for later debugging) ──────────────
+// A ring buffer in storage.local that survives reloads and merges entries from EVERY
+// context (background + sidepanel). Records the decisive automation signals — every
+// [cdp] click/key result (miss / disabled / domMutations / reachedDoc / defaultPrevented),
+// errors, and (when czDebug is on) the assistant's thinking / tool calls / results — so a
+// failed "Claude thinks it clicked but nothing happened" run can be analysed AFTER the
+// fact instead of needing live console capture.
+//   self.czLog(category, text)  — append (used by the shims; cdp entries are always kept)
+//   self.czDumpLog()            — download the whole log as a .log file (downloads API)
+//   self.czClearLog()           — wipe it
+(function () {
+  const api = (typeof browser !== 'undefined' ? browser : chrome);
+  const store = (api && api.storage && api.storage.local) || null;
+  const KEY = '__czSessionLog';
+  const CAP = 4000; // max entries kept (oldest dropped)
+  const ctx = (typeof location !== 'undefined' && /sidepanel\.html$/.test(location.pathname || '')) ? 'side'
+            : (typeof location !== 'undefined' && /_generated_background_page\.html$/.test(location.pathname || '')) ? 'bg'
+            : 'page';
+  let pending = [];
+  let timer = null;
+
+  const flush = async () => {
+    timer = null;
+    if (!pending.length || !store) return;
+    const mine = pending; pending = [];
+    try {
+      const o = await store.get(KEY);
+      let arr = (o && Array.isArray(o[KEY])) ? o[KEY] : [];
+      arr = arr.concat(mine);
+      if (arr.length > CAP) arr = arr.slice(-CAP);
+      await store.set({ [KEY]: arr });
+    } catch { pending = mine.concat(pending); } // put back, retry on next tick
+  };
+
+  self.czLog = function (cat, text) {
+    try {
+      pending.push({ t: Date.now(), c: ctx, k: String(cat || 'log'), m: String(text == null ? '' : text).slice(0, 8000) });
+      if (!timer) timer = setTimeout(flush, 1000);
+    } catch {}
+  };
+
+  self.czDumpLog = async function () {
+    await flush();
+    let all = [];
+    try { if (store) { const o = await store.get(KEY); if (o && Array.isArray(o[KEY])) all = o[KEY]; } } catch {}
+    const lines = all.slice().sort((a, b) => a.t - b.t)
+      .map((e) => `${new Date(e.t).toISOString()} [${e.c}] [${e.k}] ${e.m}`).join('\n');
+    const url = URL.createObjectURL(new Blob([lines || '(empty)'], { type: 'text/plain' }));
+    const filename = `claude-zen-session-${new Date().toISOString().replace(/[:.]/g, '-')}.log`;
+    try {
+      if (api.downloads && api.downloads.download) await api.downloads.download({ url, filename, saveAs: true });
+      else if (typeof document !== 'undefined') { const a = document.createElement('a'); a.href = url; a.download = filename; a.click(); }
+    } catch (e) { console.warn('[claude-zen] czDumpLog failed:', e && e.message); }
+    setTimeout(() => { try { URL.revokeObjectURL(url); } catch {} }, 60000);
+    return `${all.length} entries → ${filename}`;
+  };
+
+  self.czClearLog = function () { pending = []; if (store) { try { store.set({ [KEY]: [] }); } catch {} } return 'session log cleared'; };
 })();
 
 // ── chrome.tabs.query: Firefox sidebar workaround ─────────────────────────────
@@ -1203,7 +1264,11 @@ if (!chrome.debugger) {
       case 'Input.dispatchMouseEvent': {
         __ffSignalActive(tabId);
         const r = await __ffExec(tabId, __ffMouse, [params]);
-        if (r && typeof r === 'object') console.log('[claude-zen][cdp] mouse', params.type, 'raw=(' + params.x + ',' + params.y + ') dpr=' + r.dpr + ' css=(' + Math.round(r.x) + ',' + Math.round(r.y) + ') viewport=' + r.w + 'x' + r.h + ' hit=' + r.hit + (r.miss ? ' MISS' : '') + (r.disabled ? ' DISABLED' : '') + (r.act ? ' [' + r.act + ']' : ''));
+        if (r && typeof r === 'object') {
+          const line = 'mouse ' + params.type + ' raw=(' + params.x + ',' + params.y + ') dpr=' + r.dpr + ' css=(' + Math.round(r.x) + ',' + Math.round(r.y) + ') viewport=' + r.w + 'x' + r.h + ' hit=' + r.hit + (r.miss ? ' MISS' : '') + (r.disabled ? ' DISABLED' : '') + (r.act ? ' [' + r.act + ']' : '');
+          console.log('[claude-zen][cdp] ' + line);
+          try { if (self.czLog && (params.type === 'mouseReleased' || params.type === 'mousePressed')) self.czLog('cdp', 'tab' + tabId + ' ' + line); } catch {}
+        }
         // Surface a REAL failure on the decisive release phase so the bundle reports
         // an error to the model instead of a false "Clicked". CDP's real
         // Input.dispatchMouseEvent rejects on failure; the bundle awaits sendCommand
@@ -1211,6 +1276,7 @@ if (!chrome.debugger) {
         // unambiguous misses only (coords hit no element, or the target is inert) —
         // NOT on domMutations==0, which legitimately happens for nav/async renders.
         if (params.type === 'mouseReleased' && r && typeof r === 'object' && (r.miss || r.disabled)) {
+          try { if (self.czLog) self.czLog('cdp', 'tab' + tabId + ' CLICK-FAILED (' + params.x + ',' + params.y + ') ' + (r.miss ? 'miss' : 'disabled ' + r.hit)); } catch {}
           throw new Error(
             'Firefox click had no effect at (' + params.x + ',' + params.y + '): ' +
             (r.miss ? 'no element at those coordinates' : 'target is disabled/non-interactive (' + r.hit + ')') +
@@ -1224,12 +1290,14 @@ if (!chrome.debugger) {
         __ffSignalActive(tabId);
         const r = await __ffExec(tabId, __ffKey, [params]);
         console.log('[claude-zen][cdp] key', params.type, 'key=' + JSON.stringify(params.key) + ' active=' + (r && r.active));
+        try { if (self.czLog && params.type !== 'keyUp') self.czLog('cdp', 'tab' + tabId + ' key ' + JSON.stringify(params.key) + ' active=' + (r && r.active)); } catch {}
         return {};
       }
       case 'Input.insertText': {
         __ffSignalActive(tabId);
         const r = await __ffExec(tabId, __ffInsertText, [params.text]);
         console.log('[claude-zen][cdp] insertText ' + JSON.stringify(String(params.text).slice(0, 30)) + ' result=' + JSON.stringify(r));
+        try { if (self.czLog) self.czLog('cdp', 'tab' + tabId + ' insertText ' + JSON.stringify(String(params.text).slice(0, 60)) + ' ok=' + JSON.stringify(r)); } catch {}
         return {};
       }
 

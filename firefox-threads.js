@@ -126,6 +126,18 @@
         return true; // async response
       }
 
+      // Resolve the session's MAIN tab for a driven tab, straight from OUR registry.
+      // The injected Stop button uses this so STOP_AGENT carries the real numeric main
+      // tabId — the bundle's own getMainTabId can miss it (its internal groupMetadata
+      // and our registry can diverge), and then the abort never reaches the session.
+      if (msg.type === 'FF_RESOLVE_MAIN_TAB') {
+        const tid = (sender && sender.tab && sender.tab.id != null) ? sender.tab.id : msg.tabId;
+        threadForTab(tid)
+          .then((t) => sendResponse({ mainTabId: t ? t.mainTabId : null }))
+          .catch(() => sendResponse({ mainTabId: null }));
+        return true;
+      }
+
       if (msg.type === 'FF_FOCUS_TAB') {
         if (!fromExtPage(sender)) { sendResponse({ ok: false, error: 'forbidden' }); return true; }
         (async () => {

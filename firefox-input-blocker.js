@@ -85,7 +85,23 @@
     stopBtn.type = 'button';
     stopBtn.textContent = '■ Stop Claude';
     stopBtn.style.cssText = 'position:fixed;top:12px;left:50%;transform:translateX(-50%);z-index:2147483647;background:#d33;color:#fff;border:none;border-radius:999px;padding:8px 16px;font:600 13px/1 system-ui,-apple-system,sans-serif;cursor:pointer;box-shadow:0 3px 12px rgba(0,0,0,.35)';
-    stopBtn.onclick = () => { try { chrome.runtime.sendMessage({ type: 'STOP_AGENT', fromTabId: 'CURRENT_TAB' }); } catch (e) {} };
+    stopBtn.onclick = async () => {
+      // Resolve the session's MAIN tab via our registry first, so STOP_AGENT carries a
+      // real numeric tabId the bundle can route — falling back to the CURRENT_TAB
+      // sentinel (which depends on the bundle's own getMainTabId) only if that fails.
+      let fromTabId = 'CURRENT_TAB';
+      try {
+        const resp = await new Promise((res) => {
+          try { const r = chrome.runtime.sendMessage({ type: 'FF_RESOLVE_MAIN_TAB' }, (x) => res(x)); if (r && typeof r.then === 'function') r.then(res, () => res(null)); }
+          catch (e) { res(null); }
+        });
+        if (resp && resp.mainTabId != null) fromTabId = resp.mainTabId;
+      } catch (e) {}
+      try { chrome.runtime.sendMessage({ type: 'STOP_AGENT', fromTabId }); } catch (e) {}
+      // Stop blocking on this tab immediately for responsiveness; if the agent is still
+      // mid-action the heartbeat re-arms it, but the user's click to Stop must land.
+      sessionOn = false; ttlOn = false; if (ttlTimer) clearTimeout(ttlTimer); apply();
+    };
     document.body.appendChild(stopBtn);
   };
   const removeStop = () => { if (stopBtn) { try { stopBtn.remove(); } catch (e) {} stopBtn = null; } };
