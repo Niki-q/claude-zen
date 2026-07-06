@@ -46,6 +46,98 @@ if (typeof document !== 'undefined') {
 // so the preflight accepts anthropic-client-platform/version. User-Agent is a
 // forbidden fetch header and is instead set via webRequest in firefox-bg-loader.js.
 // Also logs 401/403 response bodies to surface any remaining auth failure cause.
+// ── Gate-independent "force stop" (sidepanel only) ───────────────────────────
+// The upstream STOP button no-ops in Firefox: the bundle's sidepanel STOP_AGENT
+// handler gates its abort on `isAgentRunning` (this React instance's isLoading) and
+// ignores the SW-resolved `targetTabId` — so whenever the single global sidebar
+// isn't the actively-streaming instance, or it's in a between-requests gap/backoff,
+// `cancel()` never runs and Stop silently fails (verified by tracing
+// sidepanel-*.js: `n&&s()` where n=isLoading). The *abort itself* (ne.current.abort())
+// is correct and definitively terminal: the agent loop's catch first statement is
+// `if("Request was aborted."===t)return;` — before any retry branch (verified).
+//
+// So we bypass the gate entirely: track every AbortController the page creates and,
+// on STOP, abort the one whose signal the streaming SDK is watching. Aborting the
+// SDK's OWN signal makes it throw APIUserAbortError with message exactly
+// "Request was aborted." → the loop hits that terminal branch with zero retry risk.
+// To survive the SDK combining the request signal with a timeout via AbortSignal.any,
+// we also record `.any()` source signals and walk them. Scoped to the sidepanel
+// context (where the agent SDK runs) so the background / MCP-bridge controllers are
+// never touched.
+if (typeof location !== 'undefined' && /sidepanel\.html$/.test(location.pathname)) {
+  try {
+    const W = window;
+    const AC = W.AbortController, AS = W.AbortSignal;
+    if (AC && !AC.__czTracked) {
+      const ctrlOf = new WeakMap();     // signal  -> its controller
+      const sourcesOf = new WeakMap();  // combined signal -> [source signals]
+      const liveOrder = [];             // recent controllers (WeakRef), newest last
+      function TrackedAC() {
+        const c = new AC();
+        try { ctrlOf.set(c.signal, c); liveOrder.push(new WeakRef(c)); if (liveOrder.length > 32) liveOrder.shift(); } catch {}
+        return c;
+      }
+      TrackedAC.prototype = AC.prototype;
+      TrackedAC.__czTracked = true;
+      try { W.AbortController = TrackedAC; } catch {}
+      if (AS && typeof AS.any === 'function' && !AS.any.__czTracked) {
+        const origAny = AS.any.bind(AS);
+        const patchedAny = (signals) => { const s = origAny(signals); try { sourcesOf.set(s, Array.from(signals || [])); } catch {} return s; };
+        patchedAny.__czTracked = true;
+        try { AS.any = patchedAny; } catch {}
+      }
+      // Abort the controller behind `sig` (decomposing any AbortSignal.any combination)
+      // so the SDK sees its OWN signal aborted → clean "Request was aborted.".
+      const abortSignalCtrl = (sig) => {
+        if (!sig) return false;
+        let did = false; const seen = new Set();
+        const visit = (s) => {
+          if (!s || seen.has(s)) return; seen.add(s);
+          const c = ctrlOf.get(s);
+          if (c && !s.aborted) { try { c.abort(); did = true; } catch {} }
+          const src = sourcesOf.get(s);
+          if (src) for (const x of src) visit(x);
+        };
+        visit(sig);
+        return did;
+      };
+      const abortLatest = () => {
+        for (let i = liveOrder.length - 1; i >= 0; i--) {
+          const c = liveOrder[i] && liveOrder[i].deref();
+          if (c && c.signal && !c.signal.aborted) { try { c.abort(); return true; } catch {} }
+        }
+        return false;
+      };
+      self.__czAbortSignalCtrl = abortSignalCtrl;
+      // Force-stop: abort the live /v1/messages request (precise via its captured signal,
+      // plus the freshest controller as a fallback), and arm a short window so the loop's
+      // immediate next iteration (gap / backoff retry) is killed at its fetch too.
+      self.czForceStop = (reason) => {
+        let did = false;
+        try { if (self.__czLastAgentSignal) did = abortSignalCtrl(self.__czLastAgentSignal) || did; } catch {}
+        try { did = abortLatest() || did; } catch {}
+        self.__czStopUntil = Date.now() + 2500;
+        try { if (self.czLog) self.czLog('stop', 'czForceStop reason=' + (reason || '?') + ' aborted=' + did); } catch {}
+        console.log('[claude-zen] czForceStop reason=' + (reason || '?') + ' aborted=' + did);
+        return did;
+      };
+    }
+  } catch (e) { console.warn('[claude-zen] force-stop init failed:', e && e.message); }
+
+  // Catch BOTH the bundle's own STOP_AGENT broadcast (from its main-tab stop button,
+  // re-broadcast by the SW as {type:"STOP_AGENT",targetTabId}) and our injected
+  // content-script button — either one now force-stops regardless of isAgentRunning.
+  // Observe-only: never sendResponse / return true, so the bundle's handler still owns
+  // the reply channel.
+  try {
+    (typeof browser !== 'undefined' ? browser : chrome).runtime.onMessage.addListener((m) => {
+      if (m && (m.type === 'STOP_AGENT' || m.type === 'FF_FORCE_STOP') && self.czForceStop) {
+        try { self.czForceStop(m.type); } catch {}
+      }
+    });
+  } catch {}
+}
+
 if (typeof window !== 'undefined' && typeof window.fetch === 'function') {
   const _origFetch = window.fetch;
   const _ver = (() => { try { return chrome.runtime.getManifest().version; } catch { return ''; } })();
@@ -71,6 +163,20 @@ if (typeof window !== 'undefined' && typeof window.fetch === 'function') {
 
     // Debug mirror (opt-in): log the outgoing user turn / tool results.
     const _czIsMessages = url.includes('api.anthropic.com') && url.includes('/messages');
+    // Force-stop wiring (sidepanel): remember this agent request's signal so czForceStop
+    // can abort the SDK's OWN controller (→ clean terminal "Request was aborted."), and
+    // if a stop just fired, abort this freshly-started request so the loop exits at its
+    // next iteration instead of continuing through the gap/backoff (the gate-bug case).
+    if (_czIsMessages) {
+      try {
+        const _sig = (init && init.signal) || (input && input.signal) || null;
+        if (_sig) self.__czLastAgentSignal = _sig;
+        if (self.__czStopUntil && Date.now() < self.__czStopUntil && self.__czAbortSignalCtrl) {
+          if (_sig) self.__czAbortSignalCtrl(_sig);
+          if (self.czForceStop) self.czForceStop('post-stop request');
+        }
+      } catch {}
+    }
     if (_czIsMessages && self.__czDebug && self.__czDebug.enabled) {
       try { self.__czDebug.logRequest(input, init); } catch {}
     }
@@ -79,6 +185,14 @@ if (typeof window !== 'undefined' && typeof window.fetch === 'function') {
     // array each turn, so this snapshot is the whole conversation up to the last user turn.
     if (_czIsMessages && self.czCaptureRequest) {
       try { self.czCaptureRequest(input, init); } catch {}
+    }
+    // Text-first steering (opt-in, ON by default): append a system instruction nudging
+    // the model toward the cheap text tools (read_page / get_page_text / find) instead
+    // of screenshots, to cut image tokens. Mutates the request body in place; a safe
+    // no-op when disabled, when the body shape is unexpected, or when this isn't the
+    // tool-bearing agent request (cosmetic /messages calls have no browser tools).
+    if (_czIsMessages && self.czSteerBody) {
+      try { const r = self.czSteerBody(input, init); if (r) { input = r.input; init = r.init; } } catch {}
     }
 
     const resp = await _origFetch.call(this, input, init);
@@ -161,16 +275,44 @@ if (typeof window !== 'undefined' && typeof window.fetch === 'function') {
 
   // First-user-message signature → decide whether a request continues the current chat
   // or starts a new one (the bundle's "new chat" clears messages, so messages[0] changes).
+  // The bundle re-injects a live <system-reminder>{"availableTabs":[…]}</system-reminder>
+  // into the first user message on EVERY request, and tab titles inside it can change
+  // between turns (e.g. a quiz page counting down "Time Left: 00:55:31" in its title).
+  // Comparing the raw text made the sig differ each turn → a fresh chatId per request →
+  // one conversation saved as ~30 growing duplicate snapshots. Strip reminder blocks
+  // before comparing.
+  const stripReminders = (t) => String(t || '').replace(/<system-reminder[\s\S]*?(<\/system-reminder>|$)/g, ' ');
   const firstSig = (messages) => {
     const m = messages.find((x) => x.role === 'user') || messages[0];
     if (!m) return '';
     let t = m.content;
     if (Array.isArray(t)) t = t.map((c) => c && c.type === 'text' ? c.text : '').join(' ');
-    return String(t || '').trim().slice(0, 120);
+    return stripReminders(t).replace(/\s+/g, ' ').trim().slice(0, 120);
   };
   const titleOf = (messages) => {
     const sig = firstSig(messages);
     return sig ? sig.replace(/\s+/g, ' ').slice(0, 80) : 'Untitled chat';
+  };
+  // The bundle fires SEPARATE /v1/messages calls (sidepanel-*.js) for UI cosmetics, not
+  // real conversation turns:
+  //   • status generator: "<message>…</message>\n\n…generate a 7-word-or-less status…"
+  //   • title  generator: "<conversation>…</conversation>\n\n…suggest a title…<title>…"
+  // These were each saved as their own 2-msg chat, AND (worse) poisoned the per-tab
+  // curMap so the REAL conversation got a brand-new chatId on every turn — that's why one
+  // dialog showed up as N separate growing snapshots. Detect by the fixed instruction text
+  // and skip them entirely (don't persist, don't touch curMap).
+  // "You are helping find elements" = the find tool's internal small-model helper call
+  // (one-shot, huge accessibility tree) — not a conversation; don't save it.
+  const AUX_RE = /generate a 7-word-or-less status|suggest a title based on the first message|<\/message>\s*$|<\/conversation>|^You are helping find elements on a web page/;
+  const isAuxRequest = (messages) => {
+    try {
+      for (const m of (messages || [])) {
+        let t = m && m.content;
+        if (Array.isArray(t)) t = t.map((c) => c && c.type === 'text' ? c.text : '').join(' ');
+        if (typeof t === 'string' && AUX_RE.test(t)) return true;
+      }
+    } catch {}
+    return false;
   };
 
   let writeChain = Promise.resolve();
@@ -178,6 +320,7 @@ if (typeof window !== 'undefined' && typeof window.fetch === 'function') {
     writeChain = writeChain.then(async () => {
       const activeTab = curTabId();
       if (activeTab == null) return; // not a tab-bound context (e.g. background) — skip
+      if (isAuxRequest(requestObj.messages)) return; // skip status-title generator calls
       const messages = sanitize(requestObj.messages || []);
       if (!messages.length) return;
       const sig = firstSig(requestObj.messages || []);
@@ -187,6 +330,11 @@ if (typeof window !== 'undefined' && typeof window.fetch === 'function') {
 
       const o = await store.get(KEY);
       const chats = (o && o[KEY]) || {};
+      // One-time cleanup: purge bogus status-title chats saved before isAuxRequest existed
+      // (sig/title begins with the "<message>" wrapper the generator used).
+      for (const id of Object.keys(chats)) {
+        if (/^<message>|^<conversation>/.test(String((chats[id] && chats[id].sig) || ''))) delete chats[id];
+      }
       // Rotate to a new chat if none active, the active one is gone, or the first
       // message changed (a "new chat" was started in this tab).
       if (!chatId || !chats[chatId] || (chats[chatId].sig && sig && chats[chatId].sig !== sig)) {
@@ -288,6 +436,68 @@ if (typeof window !== 'undefined' && typeof window.fetch === 'function') {
     return 'exported ' + fn;
   };
   self.czChatDelete = async (id) => { const o = await store.get(KEY); const c = (o && o[KEY]) || {}; delete c[id]; await store.set({ [KEY]: c }); return 'deleted'; };
+
+  // ── Continue a past chat: convert a saved transcript → wire-format messages ──
+  // Re-seeds a saved chat into the live bundle (see firefox-threads.js FF_CONTINUE_CHAT,
+  // which writes the result to storage.local.test_data_messages — a key the upstream
+  // sidepanel reads on mount and hydrates into its React/Zustand conversation store).
+  // Capture dropped the data the API requires for STRUCTURAL replay (tool_use has no id,
+  // tool_result no tool_use_id, thinking no signature, image no source) — seeding those
+  // blocks verbatim makes the next /v1/messages request 400. So we FLATTEN every non-text
+  // block to descriptive text, preserving turn order, then merge consecutive same-role
+  // turns so roles strictly alternate (the Messages API rejects adjacent same-role msgs).
+  const FLAT_CAP = 60000; // bound a flattened turn (blocks were already capped at capture)
+  self.czChatToStoreMessages = (chat) => {
+    if (!chat || !Array.isArray(chat.messages)) return [];
+    const flat = [];
+    for (const m of chat.messages) {
+      const role = (m && m.role === 'assistant') ? 'assistant' : 'user';
+      let text = '';
+      if (typeof m.content === 'string') {
+        text = m.content;
+      } else if (Array.isArray(m.content)) {
+        const parts = [];
+        for (const b of m.content) {
+          if (!b || !b.type) continue;
+          if (b.type === 'text') parts.push(b.text || '');
+          else if (b.type === 'thinking') parts.push('💭 [thinking] ' + (b.text || ''));
+          else if (b.type === 'tool_use') { let j = '{}'; try { j = JSON.stringify(b.input || {}); } catch {} parts.push('🔧 [tool: ' + (b.name || 'tool') + '] ' + j); }
+          else if (b.type === 'tool_result') parts.push((b.is_error ? '⚠️ [tool error] ' : '✅ [tool result] ') + (b.content || ''));
+          // image: dropped (no source data was captured)
+        }
+        text = parts.filter((s) => s !== '').join('\n\n');
+      }
+      text = String(text || '').trim();
+      if (text.length > FLAT_CAP) text = text.slice(0, FLAT_CAP) + '… [truncated]';
+      // Keep a placeholder rather than dropping an empty turn — dropping one would put two
+      // same-role turns next to each other and break alternation.
+      flat.push({ role, content: text || '·' });
+    }
+    if (chat.lastReply) flat.push({ role: 'assistant', content: trunc(chat.lastReply) });
+    // Merge consecutive same-role turns → strict alternation.
+    const out = [];
+    for (const msg of flat) {
+      const last = out[out.length - 1];
+      if (last && last.role === msg.role) last.content += '\n\n' + msg.content;
+      else out.push({ role: msg.role, content: msg.content });
+    }
+    return out;
+  };
+
+  // One-shot guard: the bundle's on-mount loader reads storage.local.test_data_messages
+  // and hydrates the live conversation, but never clears it. After "Continue" seeds it,
+  // clear it shortly after the loader (~100ms) has consumed it, so a manual sidebar reload
+  // doesn't silently re-hydrate the same transcript. Sidepanel context only.
+  try {
+    if (/sidepanel\.html$/.test(location.pathname)) {
+      setTimeout(() => {
+        store.get('test_data_messages').then((o) => {
+          const v = o && o.test_data_messages;
+          if (Array.isArray(v) && v.length) store.remove('test_data_messages').catch(() => {});
+        }).catch(() => {});
+      }, 1500);
+    }
+  } catch {}
 })();
 
 // ── Debug mirror: tee the chat to the console ─────────────────────────────────
@@ -456,6 +666,111 @@ if (typeof window !== 'undefined' && typeof window.fetch === 'function') {
   } catch {}
 })();
 
+// ── Token savers: text-first steering + screenshot downscale ───────────────────
+// Two independent knobs to cut the agent's token spend, both Layer-2 (survive
+// update-from-store.ps1 since they live in this shim, not the bundle):
+//
+//   1) Text-first steering (__czPreferText, default ON). The upstream system prompt
+//      pushes the model to screenshot for everything; screenshots are base64 images
+//      (~w*h/750 tokens each — the bulk of a session's cost). The bundle ALREADY ships
+//      cheap text observers — read_page (accessibility tree w/ ref_ids, see
+//      assets/accessibility-tree.js), get_page_text, find — so we append a system
+//      block steering the model to prefer them and screenshot only when it must SEE
+//      pixels. Appended AFTER the bundle's system blocks so the cached prefix still
+//      hits (the extra block is ~90 tokens, uncached, negligible vs an image).
+//
+//   2) Screenshot downscale (__czShotScale, default 1 = OFF/no change). Image tokens
+//      scale with PIXEL count, not file size, so JPEG quality buys nothing — only
+//      fewer pixels do. Capturing at scale s shrinks the image (and its token cost)
+//      by ~s², but the model then picks click coords in that smaller space, so the
+//      CDP mouse handler divides incoming coords by the scale the tab was last shot
+//      at (__czShotScaleByTab). Coordinate remapping is the exact class of bug this
+//      port has fought, so this stays opt-in; default 1 changes nothing.
+//
+// Toggles (sidepanel/background console): czPreferText(true|false), czShotScale(0.3..1).
+(function () {
+  const api = (typeof browser !== 'undefined' ? browser : chrome);
+  const store = (api && api.storage && api.storage.local) || null;
+  const PT = '__czPreferText', SS = '__czShotScale';
+
+  let preferText = true;            // default ON
+  self.__czShotScale = 1;           // default OFF (no downscale)
+  self.__czShotScaleByTab = Object.create(null); // tabId → scale actually used for its last shot
+
+  // Tools whose presence marks the real agent request (vs cosmetic title/status /
+  // find-helper /messages calls, which carry no browser tools → must NOT be steered).
+  const BROWSER_TOOLS = ['read_page', 'get_page_text', 'find', 'computer', 'screenshot', 'navigate', 'click'];
+  const MARK = 'cz-token-saver'; // idempotency marker inside the injected block
+  const STEER =
+    '[' + MARK + '] Token efficiency — observe the page with the TEXT tools first. ' +
+    'Prefer `read_page` (accessibility tree with ref_ids for clicking), `get_page_text`, ' +
+    'and `find` to read content, locate elements, and verify that an action worked. ' +
+    'They cost a fraction of a screenshot and are usually sufficient. ' +
+    'Use `screenshot`/`computer` ONLY when you genuinely need to see pixels — visual ' +
+    'layout or styling, canvas/video/image content, or when a text read was not enough. ' +
+    'Do NOT screenshot after every action just to confirm it; a `read_page` confirms it more cheaply.';
+
+  function hasBrowserTools(o) {
+    return Array.isArray(o.tools) && o.tools.some(t => t && BROWSER_TOOLS.includes(t.name));
+  }
+  function alreadySteered(sys) {
+    if (typeof sys === 'string') return sys.includes(MARK);
+    if (Array.isArray(sys)) return sys.some(b => b && typeof b.text === 'string' && b.text.includes(MARK));
+    return false;
+  }
+  function withSteer(sys) {
+    const block = { type: 'text', text: STEER };
+    if (sys == null) return [block];
+    if (typeof sys === 'string') return [{ type: 'text', text: sys }, block];
+    if (Array.isArray(sys)) return sys.concat([block]);
+    return sys; // unknown shape → leave untouched
+  }
+
+  // Returns {input, init} with a mutated body, or null to send the original unchanged.
+  // Only the string-body-in-init path (the Anthropic SDK's path) is handled; the
+  // Request-object path would need async reconstruction and isn't used by the SDK.
+  self.czSteerBody = function (input, init) {
+    if (!preferText) return null;
+    if (!init || typeof init.body !== 'string') return null;
+    let o; try { o = JSON.parse(init.body); } catch { return null; }
+    if (!o || !Array.isArray(o.messages) || !hasBrowserTools(o)) return null;
+    if (alreadySteered(o.system)) return null;
+    o.system = withSteer(o.system);
+    return { input, init: { ...init, body: JSON.stringify(o) } };
+  };
+
+  // Console toggles.
+  self.czPreferText = function (on) {
+    preferText = (on === undefined) ? true : !!on;
+    if (store) { try { store.set({ [PT]: preferText }); } catch {} }
+    console.log('[claude-zen] text-first steering ' + (preferText ? 'ON' : 'OFF'));
+    return preferText;
+  };
+  self.czShotScale = function (n) {
+    n = Number(n); if (!isFinite(n) || n <= 0) n = 1;
+    n = Math.max(0.3, Math.min(1, n));
+    self.__czShotScale = n;
+    if (store) { try { store.set({ [SS]: n }); } catch {} }
+    console.log('[claude-zen] screenshot scale = ' + n + (n < 1 ? ' (downscaled — clicks remapped)' : ' (full size)'));
+    return n;
+  };
+
+  // Load persisted values + react to toggles from other contexts.
+  if (store) {
+    try { store.get([PT, SS]).then((o) => {
+      if (o && typeof o[PT] === 'boolean') preferText = o[PT];
+      if (o && typeof o[SS] === 'number' && o[SS] > 0) self.__czShotScale = Math.max(0.3, Math.min(1, o[SS]));
+    }); } catch {}
+  }
+  try {
+    api.storage.onChanged.addListener((ch, area) => {
+      if (area !== 'local' || !ch) return;
+      if (ch[PT] && typeof ch[PT].newValue === 'boolean') preferText = ch[PT].newValue;
+      if (ch[SS] && typeof ch[SS].newValue === 'number' && ch[SS].newValue > 0) self.__czShotScale = Math.max(0.3, Math.min(1, ch[SS].newValue));
+    });
+  } catch {}
+})();
+
 // ── Persistent session log (save to computer for later debugging) ──────────────
 // A ring buffer in storage.local that survives reloads and merges entries from EVERY
 // context (background + sidepanel). Records the decisive automation signals — every
@@ -615,6 +930,69 @@ if (chrome.tabs && chrome.tabs.query) {
     const _wcreate = chrome.windows.create.bind(chrome.windows);
     chrome.windows.create = function (opts, cb) {
       return (typeof cb === 'function') ? _wcreate(fix(opts), cb) : _wcreate(fix(opts));
+    };
+  }
+})();
+
+// ── Pending-URL tracking: emulate Chrome's tab.pendingUrl for about:* tabs ─────
+// Firefox reports a freshly created / still-navigating tab's url as "about:blank" /
+// "about:newtab" until the navigation COMMITS, and `new URL("about:blank").host`
+// is "" — empty. The bundle's permission flow keys every grant on that host
+// (PermissionManager.findApplicablePermission requires a TRUTHY netloc), so when a
+// tool ran against a tab whose navigation hadn't committed yet:
+//   • the permission prompt showed "this page" and every user click ("Allow once"/
+//     "Always allow") stored a dead {netloc:""} grant that can never match;
+//   • the post-grant retry re-checked the same empty host and threw
+//     "Permission still required after granting" — an unbreakable loop.
+// Chrome doesn't hit this because chrome://newtab parses with host "newtab" and
+// tabs expose `pendingUrl` during navigation. We emulate the useful part: record
+// the target URL whenever the bundle creates/navigates a tab, and have the
+// tabs.get/query overlay report it as the tab's url while the native url is still
+// about:*-ish. (Entries expire after 45s or as soon as a real URL commits.)
+(function () {
+  const PENDING_TTL = 45000;
+  const BLANKISH = /^about:(blank|newtab|home|privatebrowsing)?$/i;
+  const pending = new Map(); // tabId → { url, ts }
+
+  self.__czRecordPendingUrl = (tabId, url) => {
+    if (typeof tabId === 'number' && typeof url === 'string' && /^https?:/i.test(url)) {
+      pending.set(tabId, { url, ts: Date.now() });
+    }
+  };
+  // Mutates the tab object in place; safe on overlay copies.
+  self.__czApplyPendingUrl = (t) => {
+    if (!t || typeof t.id !== 'number') return t;
+    const p = pending.get(t.id);
+    if (!p) return t;
+    if (Date.now() - p.ts > PENDING_TTL || (t.url && !BLANKISH.test(t.url))) {
+      pending.delete(t.id); // committed (or stale) — native url wins again
+      return t;
+    }
+    if (!t.url || BLANKISH.test(t.url)) {
+      t.url = p.url;
+      t.pendingUrl = p.url;
+      if (!t.status) t.status = 'loading';
+    }
+    return t;
+  };
+
+  if (chrome.tabs && typeof chrome.tabs.update === 'function') {
+    const _update = chrome.tabs.update.bind(chrome.tabs);
+    chrome.tabs.update = function (...args) {
+      // Signature: update([tabId], props, [cb]) — record only the explicit-tabId form.
+      if (typeof args[0] === 'number' && args[1] && typeof args[1].url === 'string') {
+        self.__czRecordPendingUrl(args[0], args[1].url);
+      }
+      return _update(...args);
+    };
+  }
+  if (chrome.tabs && typeof chrome.tabs.create === 'function') {
+    const _create = chrome.tabs.create.bind(chrome.tabs); // newtab-fix wrapper above
+    chrome.tabs.create = function (opts, cb) {
+      const url = opts && typeof opts.url === 'string' ? opts.url : null;
+      const tag = (tab) => { if (tab && url) self.__czRecordPendingUrl(tab.id, url); return tab; };
+      if (typeof cb === 'function') return _create(opts, (tab) => cb(tag(tab)));
+      return _create(opts).then(tag);
     };
   }
 })();
@@ -855,7 +1233,16 @@ if (typeof document !== 'undefined' &&
   const PRIVILEGED = /^(moz-extension|chrome-extension|about|chrome|view-source|data|resource|file):/i;
   const isGroupable = async (id) => {
     if (!nativeAllowed() || !_natGet) return false;
-    try { const t = await _natGet(id); const u = t && t.url; return !!u && !PRIVILEGED.test(u); }
+    try {
+      const t = await _natGet(id);
+      // Pinned tabs (incl. Zen's "essential"/pinned tabs) live OUTSIDE the normal tab
+      // strip; native tabs.group()/move() would yank them out of the pinned area into
+      // the group's position — visibly un-pinning the user's tab. Treat pinned like a
+      // privileged page: keep it in the registry (emulated) so the agent still controls
+      // its tabs, but never physically group/move it. (Verified against Zen pinned tabs.)
+      if (t && t.pinned) return false;
+      const u = t && t.url; return !!u && !PRIVILEGED.test(u);
+    }
     catch { return false; }
   };
 
@@ -984,6 +1371,7 @@ if (typeof document !== 'undefined' &&
           if (t && typeof t.id === 'number') {
             if (st.memb[t.id] != null) t.groupId = st.memb[t.id];
             else if (typeof t.groupId !== 'number') t.groupId = NONE;
+            if (self.__czApplyPendingUrl) self.__czApplyPendingUrl(t);
           }
         }
         if (wantGroup) tabs = tabs.filter((t) => t.groupId === gid);
@@ -1001,6 +1389,7 @@ if (typeof document !== 'undefined' &&
         if (t) {
           if (st.memb[tabId] != null) t.groupId = st.memb[tabId];
           else if (typeof t.groupId !== 'number') t.groupId = NONE;
+          if (self.__czApplyPendingUrl) self.__czApplyPendingUrl(t);
         }
         return t;
       };
@@ -1211,7 +1600,12 @@ if (typeof document !== 'undefined' &&
         try {
           const t = await _natGet(tabId);
           const u = t && t.url;
-          if (!u || PRIVILEGED.test(u)) {
+          // Never redirect a PINNED tab (incl. Zen pinned/essential): the user pinned it
+          // deliberately; navigating it away would clobber their tab. Pinned main tabs stay
+          // put and get an emulated group below (the agent still controls their tabs).
+          if (t && t.pinned) {
+            console.log('[claude-zen][groups] ensureMainGroup: main tab', tabId, 'is pinned — leaving in place (emulated group)');
+          } else if (!u || PRIVILEGED.test(u)) {
             await chrome.tabs.update(tabId, { url: 'https://duckduckgo.com' });
             console.log('[claude-zen][groups] ensureMainGroup: navigated privileged main tab', tabId, '→ duckduckgo.com');
           }
@@ -1319,8 +1713,16 @@ if (!chrome.debugger) {
     const elAt = document.elementFromPoint(x, y);
     const el = elAt || document.body;
     const miss = !elAt;
+    // Inertness must be read NOW, at hit time. Sites (Angular Material follow-up
+    // chips on NotebookLM, etc.) flip the target to disabled / pointer-events:none
+    // AS A RESULT of the click — reading the style after dispatch reported a
+    // successful click as "target is disabled" and made the agent retry forever.
+    let disabled = false;
+    try { if (el && (el.disabled || (el.getAttribute && el.getAttribute('aria-disabled') === 'true'))) disabled = true; } catch {}
+    try { const cs = el && getComputedStyle(el); if (cs && cs.pointerEvents === 'none') disabled = true; } catch {}
     const button = { left: 0, middle: 1, right: 2, none: 0 }[p.button] ?? 0;
     let clickMeta = null;
+    let mut = null; // DOM mutations observed across the release phase
     const base = {
       bubbles: true, cancelable: true, composed: true, view: window,
       clientX: x, clientY: y, screenX: x, screenY: y,
@@ -1390,6 +1792,7 @@ if (!chrome.debugger) {
           // Give sync handlers + a frame of async re-render time to mutate the DOM.
           await new Promise((r) => setTimeout(r, 160));
           try { if (obs) obs.disconnect(); } catch {}
+          mut = mutations;
           clickMeta = 'reachedDoc=' + reached + ' defaultPrevented=' + (!notPrevented) + ' domMutations=' + mutations;
         }
         break;
@@ -1413,12 +1816,9 @@ if (!chrome.debugger) {
       if (t) s += ' "' + t.slice(0, 24) + '"';
       return s;
     };
-    // Is the resolved target inert (can't receive the click)? Surface it so the
-    // caller can report a real failure instead of a false "Clicked".
-    let disabled = false;
-    try { if (el && (el.disabled || (el.getAttribute && el.getAttribute('aria-disabled') === 'true'))) disabled = true; } catch {}
-    try { const cs = el && getComputedStyle(el); if (cs && cs.pointerEvents === 'none') disabled = true; } catch {}
-    return { dpr, x, y, hit: d(el), miss, disabled, w: window.innerWidth, h: window.innerHeight, act: clickMeta };
+    // (`disabled` was computed at hit time, before dispatch — see above. `d(el)`
+    // re-reads the flags for the log line only; post-click pe:none there is normal.)
+    return { dpr, x, y, hit: d(el), miss, disabled, mut, w: window.innerWidth, h: window.innerHeight, act: clickMeta };
   };
 
   const __ffKey = (p) => {
@@ -1439,21 +1839,39 @@ if (!chrome.debugger) {
     }
     // Backspace/Delete in editable targets have no default action for synthetic
     // events — emulate the edit so the bundle's key-based deletes still work.
-    if (type === 'keydown' && el.isContentEditable) {
+    // Snapshot before/after so the caller can detect a delete that didn't land
+    // (synthetic key ignored). null = not a verifiable delete.
+    let editChanged = null;
+    if (type === 'keydown' && el.isContentEditable && (p.key === 'Backspace' || p.key === 'Delete')) {
+      const before = el.textContent || '';
       if (p.key === 'Backspace') { try { document.execCommand('delete'); } catch {} }
-      else if (p.key === 'Delete') { try { document.execCommand('forwardDelete'); } catch {} }
+      else { try { document.execCommand('forwardDelete'); } catch {} }
+      editChanged = (el.textContent || '') !== before;
     }
     const a = document.activeElement;
-    return { active: a ? ((a.tagName || '?').toLowerCase() + (a.id ? '#' + a.id : '') + (a.isContentEditable ? '[ce]' : '') + ('value' in a ? '[input]' : '')) : 'null' };
+    return {
+      active: a ? ((a.tagName || '?').toLowerCase() + (a.id ? '#' + a.id : '') + (a.isContentEditable ? '[ce]' : '') + ('value' in a ? '[input]' : '')) : 'null',
+      editChanged,
+    };
   };
 
   const __ffInsertText = (text) => {
     const el = document.activeElement;
-    if (!el) return false;
-    if (el.isContentEditable) {
-      try { document.execCommand('insertText', false, text); return true; } catch {}
+    if (!el) return { ok: false, changed: false, reason: 'no-active-element' };
+    const editable = el.isContentEditable;
+    const hasValue = ('value' in el);
+    // Snapshot before so the caller can detect an insert that didn't land (field rejects
+    // synthetic input / no editable target). target string mirrors __ffKey's `active`.
+    const before = editable ? (el.textContent || '') : (hasValue ? String(el.value) : '');
+    const tgt = (el.tagName || '?').toLowerCase() + (el.id ? '#' + el.id : '') + (editable ? '[ce]' : '') + (hasValue ? '[input]' : '');
+    const done = (ok) => {
+      const after = editable ? (el.textContent || '') : (hasValue ? String(el.value) : '');
+      return { ok: !!ok, changed: after !== before, target: tgt };
+    };
+    if (editable) {
+      try { const ok = document.execCommand('insertText', false, text); return done(ok); } catch {}
     }
-    if ('value' in el) {
+    if (hasValue) {
       // Use the native value setter so React's onChange tracking fires.
       const proto = el instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
       const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
@@ -1464,15 +1882,36 @@ if (!chrome.debugger) {
       try { el.setSelectionRange(pos, pos); } catch {}
       el.dispatchEvent(new InputEvent('input', { bubbles: true, composed: true, data: text, inputType: 'insertText' }));
       el.dispatchEvent(new Event('change', { bubbles: true }));
-      return true;
+      return done(true);
     }
-    try { document.execCommand('insertText', false, text); return true; } catch {}
-    return false;
+    try { const ok = document.execCommand('insertText', false, text); return done(ok); } catch {}
+    return done(false);
   };
 
-  const __ffEval = (expr) => {
-    // eslint-disable-next-line no-eval
-    return (0, eval)(expr);
+  const __ffEval = async (expr) => {
+    // Page-world eval errors must come back as DATA (not a rejection): executeScript
+    // reports a thrown func inconsistently across FF versions, and the bundle's
+    // javascript_tool needs a CDP-shaped `exceptionDetails` to render the real error.
+    try {
+      // eslint-disable-next-line no-eval
+      let value = (0, eval)(expr);
+      // CDP Runtime.evaluate(awaitPromise) parity: resolve thenables so async page
+      // code returns its value, not "[object Promise]".
+      if (value && typeof value.then === 'function') value = await value;
+      // The result crosses worlds via structured clone — DOM nodes/functions throw
+      // and would nuke the WHOLE response. Degrade them to a string instead.
+      if (typeof value === 'function') value = String(value);
+      else {
+        try { if (typeof structuredClone === 'function') structuredClone(value); }
+        catch {
+          try { value = JSON.parse(JSON.stringify(value)); }
+          catch { value = String(value); }
+        }
+      }
+      return { __czOk: true, value };
+    } catch (e) {
+      return { __czOk: false, error: String((e && (e.stack || e.message)) || e) };
+    }
   };
 
   const __ffSend = async (target, method, params = {}) => {
@@ -1490,10 +1929,42 @@ if (!chrome.debugger) {
         return {};
 
       case 'Page.captureScreenshot': {
+        // Keep the input-blocker armed during the agent's observe-loop: it screenshots
+        // repeatedly while "thinking" with no Input.* dispatch, and the heartbeat TTL
+        // (8s) would otherwise lapse mid-session and let real user clicks through
+        // ("запрет не работает" intermittently). A screenshot of the driven tab is proof
+        // the session is active on it, so refresh the block here too. Strictly extends
+        // blocking during active operation — never affects synthetic clicks/typing.
+        __ffSignalActive(tabId);
+        const fmt = {
+          format: params.format === 'jpeg' ? 'jpeg' : 'png',
+          ...(params.quality != null ? { quality: params.quality } : {}),
+        };
+        // Token-saver downscale (__czShotScale, default 1 = no change): capturing at
+        // scale s<1 yields an s× image (~s² the pixels → ~s² the image tokens). The
+        // model then picks click coords in that smaller space, so we record the scale
+        // actually used per tab (__czShotScaleByTab) and Input.dispatchMouseEvent
+        // divides incoming coords by it. captureVisibleTab has no scale param → that
+        // fallback is always full-size, so it records 1 (clicks unscaled).
+        const _shotScale = (typeof self.__czShotScale === 'number' && self.__czShotScale > 0) ? self.__czShotScale : 1;
+        // Prefer tabs.captureTab(tabId) (FF 59+): it captures the REQUESTED tab even
+        // when it isn't active — captureVisibleTab grabs the window's active tab, so
+        // if the user switched away the agent "saw" the wrong page and looped.
+        // scale:1 pins the image to CSS pixels, matching the coordinate space the
+        // click shim expects (see __ffMouse) regardless of devicePixelRatio.
+        if (typeof __ffApi.tabs.captureTab === 'function') {
+          try {
+            const dataUrl = await __ffApi.tabs.captureTab(tabId, { ...fmt, scale: _shotScale });
+            if (self.__czShotScaleByTab) self.__czShotScaleByTab[tabId] = _shotScale;
+            return { data: String(dataUrl).replace(/^data:image\/\w+;base64,/, '') };
+          } catch (e) {
+            try { if (self.czLog) self.czLog('cdp', 'tab' + tabId + ' captureTab failed (' + (e && e.message) + ') — falling back to captureVisibleTab'); } catch {}
+          }
+        }
+        if (self.__czShotScaleByTab) self.__czShotScaleByTab[tabId] = 1; // fallback path is full-size
         const tab = await __ffApi.tabs.get(tabId);
-        // captureVisibleTab grabs the ACTIVE tab of the window, not an arbitrary
-        // target. If the agent's tab isn't active, the agent "sees" the wrong tab
-        // and loops. Log a loud warning so this is visible in the field.
+        // Fallback: captureVisibleTab grabs the ACTIVE tab of the window, not an
+        // arbitrary target. Log a loud warning if that's the wrong tab.
         try {
           const act = await __ffApi.tabs.query({ active: true, windowId: tab.windowId });
           const activeId = act && act[0] && act[0].id;
@@ -1501,15 +1972,20 @@ if (!chrome.debugger) {
             console.warn('[claude-zen][cdp] screenshot MISMATCH: target tab', tab.id, '(' + (tab.url || '').slice(0, 40) + ') is NOT active in window', tab.windowId, '— capturing active tab', activeId, 'instead');
           }
         } catch {}
-        const dataUrl = await __ffApi.tabs.captureVisibleTab(tab.windowId, {
-          format: params.format === 'jpeg' ? 'jpeg' : 'png',
-          ...(params.quality != null ? { quality: params.quality } : {}),
-        });
+        const dataUrl = await __ffApi.tabs.captureVisibleTab(tab.windowId, fmt);
         return { data: String(dataUrl).replace(/^data:image\/\w+;base64,/, '') };
       }
 
       case 'Input.dispatchMouseEvent': {
         __ffSignalActive(tabId);
+        // Token-saver coordinate remap: if this tab's last screenshot was downscaled
+        // (__czShotScale<1), the model's coords are in the shrunk image's space; scale
+        // them back up to CSS pixels (what __ffMouse / elementFromPoint expect). No-op
+        // at the default scale 1.
+        const _ms = (self.__czShotScaleByTab && self.__czShotScaleByTab[tabId]) || 1;
+        if (_ms !== 1 && params && typeof params.x === 'number') {
+          params = { ...params, x: params.x / _ms, y: params.y / _ms };
+        }
         const r = await __ffExec(tabId, __ffMouse, [params]);
         if (r && typeof r === 'object') {
           const line = 'mouse ' + params.type + ' raw=(' + params.x + ',' + params.y + ') dpr=' + r.dpr + ' css=(' + Math.round(r.x) + ',' + Math.round(r.y) + ') viewport=' + r.w + 'x' + r.h + ' hit=' + r.hit + (r.miss ? ' MISS' : '') + (r.disabled ? ' DISABLED' : '') + (r.act ? ' [' + r.act + ']' : '');
@@ -1520,10 +1996,13 @@ if (!chrome.debugger) {
         // an error to the model instead of a false "Clicked". CDP's real
         // Input.dispatchMouseEvent rejects on failure; the bundle awaits sendCommand
         // and propagates the rejection into the tool result. Gate conservatively on
-        // unambiguous misses only (coords hit no element, or the target is inert) —
-        // NOT on domMutations==0, which legitimately happens for nav/async renders.
-        if (params.type === 'mouseReleased' && r && typeof r === 'object' && (r.miss || r.disabled)) {
-          try { if (self.czLog) self.czLog('cdp', 'tab' + tabId + ' CLICK-FAILED (' + params.x + ',' + params.y + ') ' + (r.miss ? 'miss' : 'disabled ' + r.hit)); } catch {}
+        // unambiguous misses only: coords hit no element, or the target was inert AT
+        // HIT TIME and the click provably changed nothing (mut===0). An inert-looking
+        // target WITH mutations means the press/release did fire handlers (sites flip
+        // pointer-events/disabled as a *result* of the click) — that's a success.
+        if (params.type === 'mouseReleased' && r && typeof r === 'object' &&
+            (r.miss || (r.disabled && r.mut === 0))) {
+          try { if (self.czLog) self.czLog('cdp', 'tab' + tabId + ' CLICK-FAILED (' + params.x + ',' + params.y + ') ' + (r.miss ? 'miss' : 'disabled ' + r.hit + ' mut=' + r.mut)); } catch {}
           throw new Error(
             'Firefox click had no effect at (' + params.x + ',' + params.y + '): ' +
             (r.miss ? 'no element at those coordinates' : 'target is disabled/non-interactive (' + r.hit + ')') +
@@ -1538,6 +2017,13 @@ if (!chrome.debugger) {
         const r = await __ffExec(tabId, __ffKey, [params]);
         console.log('[claude-zen][cdp] key', params.type, 'key=' + JSON.stringify(params.key) + ' active=' + (r && r.active));
         try { if (self.czLog && params.type !== 'keyUp') self.czLog('cdp', 'tab' + tabId + ' key ' + JSON.stringify(params.key) + ' active=' + (r && r.active)); } catch {}
+        // Untrusted-input detection (log-only — many keys legitimately change nothing):
+        // a Backspace/Delete in a contentEditable that left the content untouched is a
+        // sign the synthetic key was ignored (isTrusted=false). We only LOG it (not throw)
+        // because a delete at an empty/boundary field legitimately changes nothing.
+        if (r && r.editChanged === false && (params.key === 'Backspace' || params.key === 'Delete')) {
+          try { if (self.czLog) self.czLog('cdp', 'tab' + tabId + ' KEY-IGNORED ' + params.key + ' (editable unchanged — synthetic key may be ignored or nothing to delete)'); } catch {}
+        }
         return {};
       }
       case 'Input.insertText': {
@@ -1545,12 +2031,37 @@ if (!chrome.debugger) {
         const r = await __ffExec(tabId, __ffInsertText, [params.text]);
         console.log('[claude-zen][cdp] insertText ' + JSON.stringify(String(params.text).slice(0, 30)) + ' result=' + JSON.stringify(r));
         try { if (self.czLog) self.czLog('cdp', 'tab' + tabId + ' insertText ' + JSON.stringify(String(params.text).slice(0, 60)) + ' ok=' + JSON.stringify(r)); } catch {}
+        // Untrusted-input detection: non-empty text that produced NO change means the
+        // insert didn't land — the field rejects synthetic input (isTrusted=false) or
+        // nothing editable was focused. Surface a real error so the model retries instead
+        // of believing it typed. CDP Input.insertText rejects on failure; the bundle
+        // propagates the rejection into the tool result.
+        if (params.text && r && typeof r === 'object' && r.changed === false) {
+          try { if (self.czLog) self.czLog('cdp', 'tab' + tabId + ' PASTE-IGNORED ' + (r.ok ? ('no change on ' + r.target) : ('reason=' + (r.reason || '?')))); } catch {}
+          throw new Error(
+            'Firefox text insert had no effect: the focused target (' + (r.target || r.reason || 'none') +
+            ') did not change. The field may reject synthetic input (isTrusted=false), or nothing editable was focused — click the field first and retry.');
+        }
         return {};
       }
 
       case 'Runtime.evaluate': {
-        const value = await __ffExec(tabId, __ffEval, [params.expression]);
-        return { result: { type: typeof value, value } };
+        // Never throw and never return a malformed shape: the bundle reads
+        // `m.exceptionDetails` / `m.result.type` unguarded — an undefined response
+        // crashed javascript_tool with "can't access property exceptionDetails".
+        const asException = (msg) => ({
+          result: { type: 'undefined' },
+          exceptionDetails: { text: msg, exception: { description: msg } },
+        });
+        try {
+          const r = await __ffExec(tabId, __ffEval, [params.expression]);
+          if (r && r.__czOk === false) return asException(r.error || 'Unknown error');
+          const value = r && r.__czOk ? r.value : undefined;
+          return { result: { type: typeof value, value } };
+        } catch (e) {
+          // executeScript itself failed (privileged page, missing host permission…)
+          return asException(String((e && e.message) || e));
+        }
       }
 
       default:

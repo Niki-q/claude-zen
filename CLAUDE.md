@@ -69,14 +69,16 @@ Hand-written classic (non-module) scripts that are loaded **before** the bundle 
   **Access boundary**: the upstream bundle only acts on tabs whose group matches the session's group, bailing when `tab.groupId === TAB_GROUP_ID_NONE` (in `service-worker.ts-*.js` / `sidepanel-*.js`) and enumerating siblings via `tabs.query({groupId})` (in `mcpPermissions-*.js`). The group is the access boundary — Claude only touches tabs in the group it created. The hybrid honors this in both real and emulated modes.
 
 - **`chrome.debugger` (page automation via Chrome DevTools Protocol)**: Firefox has no debugger API. Translates CDP commands to Firefox `scripting.executeScript()`:
-  - `Input.dispatchMouseEvent` → synthetic `MouseEvent` in page MAIN world
+  - `Input.dispatchMouseEvent` → synthetic `MouseEvent` + `PointerEvent` pair in page MAIN world. **Click-failure reporting**: a release that hits no element, or hits a target that was inert **at hit time** *and* produced **zero DOM mutations**, rejects so the model gets a real error instead of a false "Clicked". The inert check (`disabled`/`aria-disabled`/`pointer-events:none`) is read **before** dispatch — sites (e.g. Angular Material chips on NotebookLM) flip the target to `pe:none` *as a result* of the click, and reading it after dispatch falsely failed successful clicks; DOM-mutation evidence (`mut>0`) likewise counts as success.
   - `Input.dispatchKeyEvent` → synthetic `KeyboardEvent` (with special handling for Backspace/Delete on contentEditable)
   - `Input.insertText` → `insertText` command or direct value setter with change/input events
-  - `Page.captureScreenshot` → `browser.tabs.captureVisibleTab()`
-  - `Runtime.evaluate` → `executeScript(...eval(expr))`
+  - `Page.captureScreenshot` → `browser.tabs.captureTab(tabId, {scale:1})` (FF 59+, captures the **requested** tab even when inactive); falls back to `tabs.captureVisibleTab()` (active tab only — logs a loud MISMATCH warning if that's the wrong tab). `scale:1` pins the image to CSS pixels = the click shim's coordinate space.
+  - `Runtime.evaluate` → `executeScript(...eval(expr))`; awaits thenables (CDP `awaitPromise` parity), degrades non-cloneable results to strings, and **never throws** — eval/injection errors return a CDP-shaped `{exceptionDetails}` (the bundle reads `m.exceptionDetails` unguarded; an undefined response crashed `javascript_tool` with "can't access property exceptionDetails").
   - `*.enable/disable`, `attach/detach/getTargets` → no-op
   
   **Limitation**: Synthetic events are untrusted (`isTrusted === false`). Elements gating on trusted input may not respond.
+
+- **Pending-URL tracking (Chrome `pendingUrl` emulation)**: Firefox reports a freshly created / still-navigating tab's `url` as `about:blank`/`about:newtab` until the navigation **commits**, and `new URL("about:blank").host === ""`. The bundle's permission system keys every grant on that host (`findApplicablePermission` requires a *truthy* netloc), so a tool that ran before commit caused: prompt shows "this page" → every user click stores a dead `{netloc:""}` grant → post-grant retry re-checks the same empty host → **"Permission still required after granting" loop** (burned an entire session; Chrome is immune because `chrome://newtab` has host `"newtab"` and tabs expose `pendingUrl`). Fix: `tabs.create`/`tabs.update` wraps record the target URL (`__czRecordPendingUrl`), and the `tabs.get`/`query` overlay reports it as the tab's `url` (+`pendingUrl`) while the native url is still `about:*`-ish (`__czApplyPendingUrl`; 45s TTL, cleared on commit).
 
 - **`chrome.offscreen`**: Reports `hasDocument: true` (Firefox background is a real DOM page, unlike Chrome's service worker). Bundle's offscreen messages are dispatched in-process; sidepanel offscreen requests route to background via `runtime.sendMessage()`.
 
@@ -92,6 +94,10 @@ Hand-written classic (non-module) scripts that are loaded **before** the bundle 
 
 - **Fetch header injection**: Adds `anthropic-client-platform` and `anthropic-client-version` headers to requests to `api.anthropic.com` (redundant with webRequest injection, but ensures page-context requests are marked correctly). Also detects and logs 401/403 response bodies.
 
+- **Gate-independent force-stop (`czForceStop`, sidepanel only)**: the upstream Stop no-ops in Firefox — the bundle's sidepanel `STOP_AGENT` handler gates its abort on `n` = `isAgentRunning` (this React instance's `isLoading`) and **ignores the SW-resolved `targetTabId`**. So whenever the single global sidebar isn't the actively-streaming instance, or it's in a between-requests **gap/backoff** (`isLoading` momentarily false while the agent loop is still alive), `n&&s()` short-circuits and `cancel()` never runs — yet `{success:true}` is still returned, so the failure is silent. The *abort itself* (`ne.current.abort()`) is correct and **definitively terminal**: the agent loop's catch first statement is `if("Request was aborted."===t)return;`, which runs **before** any retry/backoff branch (verified by tracing `sidepanel-*.js`; an abort is retry-proof because its message matches none of the 5xx/`network error`/`stream idle`/… retry prefixes). We bypass the broken gate: the shim **patches `AbortController`** (and `AbortSignal.any`, to decompose a request signal the SDK combined with its timeout) to track every controller the sidepanel page creates, then on STOP aborts the one whose signal the streaming SDK is **watching** — aborting the SDK's *own* signal makes it throw `APIUserAbortError` with message exactly `"Request was aborted."` → the terminal branch fires with zero retry risk. The fetch wrapper records each `/v1/messages` request's `signal` (`__czLastAgentSignal`) for a precise abort, and arms a ~2.5 s `__czStopUntil` window so the loop's *immediate next* request (the gap/backoff iteration) is aborted at its own fetch too. A sidepanel `runtime.onMessage` listener fires `czForceStop` on **both** `STOP_AGENT` (the bundle's main-tab button → SW re-broadcast `{targetTabId}`, *and* our injected content-script `#__cz_stop_btn`) and our own `FF_FORCE_STOP` — observe-only (never `sendResponse`/`return true`, so the bundle's handler keeps the reply channel). Scoped to `sidepanel.html` so the background / MCP-bridge controllers are never touched.
+
+- **Input-block heartbeat on screenshot**: `__ffSignalActive(tabId)` is fired on `Page.captureScreenshot` too, not only on `Input.*` dispatch. During the agent's observe-loop (repeated screenshots, no input dispatch for >8 s) the input-blocker's heartbeat TTL would otherwise lapse and let real user clicks through ("запрет не работает" intermittently). A screenshot of the driven tab is proof the session is active on it; this strictly extends blocking during active operation and never affects synthetic clicks/typing.
+
 - **CDN script blocking**: Intercepts `Element.prototype.appendChild/insertBefore` to block Segment CDN scripts blocked by extension CSP.
 
 - **Datadog SDK warnings**: Suppresses known Datadog double-bundle warnings from console.
@@ -100,9 +106,11 @@ Hand-written classic (non-module) scripts that are loaded **before** the bundle 
 
 ### `firefox-bg-loader.js`
 
-**Purpose**: Background-context specific logic: OAuth flows, webRequest handlers, DNR setup, and entry point for dynamic import of the service worker bundle.
+**Purpose**: Background-context specific logic: OAuth flows, webRequest handlers, DNR setup, the MCP-bridge unblock, and entry point for dynamic import of the service worker bundle.
 
 **Key handlers**:
+
+- **MCP bridge unblock (`ServiceWorkerGlobalScope` shim)**: defines `globalThis.ServiceWorkerGlobalScope` (a dummy) **in the background only** — this file is never injected into pages. The MCP WebSocket relay (`wss://bridge.claudeusercontent.com`, the hosted bridge that pairs the extension with a desktop Claude / Claude Code) is driven by `mcpPermissions-*.js`, whose three background-only setups (`fn()` = the bridge-keepalive alarm → WS connect, `es()` = bridge-tab nav tracking, `PermissionManager.Ie()` = direct token read) are **all gated on `"ServiceWorkerGlobalScope" in globalThis`**. Chrome's background IS a SW so that's true; Firefox's background is a DOM page so it was **false → the bridge never connected** (the same "FF background is a DOM page, not a SW" gotcha as tab-groups). Defining it flips all three to the correct Chrome-SW behaviour; the sidepanel (never loads this file) keeps message-routing token refresh to the background, exactly like Chrome's sidepanel. Read only as a presence check, never as a constructor. **Native-host MCP (`connectNative`) stays an unported graceful no-op** (needs an OS-level host binary); the WS bridge is the code-only transport. **End-to-end MCP tool use needs a paired desktop companion** — can't be verified in-repo.
 
 - **`FF_IDENTITY_LAUNCH` message listener**: Routes OAuth from sidepanel via `browser.identity.launchWebAuthFlow()` or falls back to `manualTabAuth()`.
 
@@ -121,6 +129,10 @@ Hand-written classic (non-module) scripts that are loaded **before** the bundle 
 - **webRequest header injection**: `onBeforeSendHeaders` listener that:
   - Sets/overwrites `anthropic-client-platform`, `anthropic-client-version`, and `user-agent` headers
   - **Strips `Origin` and `Referer` headers** before requests to `api.anthropic.com` (Firefox sidepanel origin is `moz-extension://<uuid>`; the API classifies origin-bearing requests as CORS and rejects with 401 "CORS requests are not allowed"; stripping makes it look server-side)
+
+- **MCP bridge WS Origin rewrite**: a second `onBeforeSendHeaders` listener scoped to `wss://bridge.claudeusercontent.com/*` (+ staging) that **rewrites the WebSocket-handshake `Origin`** from `moz-extension://<uuid>` to the Chrome-extension origin `chrome-extension://fcoeoabgfenejglbffodgkkbkcdhcgfn` (and strips `Referer`). The bridge can reject an unknown origin (closes with code 1008 → the bundle then clears the access token), so we mimic the genuine Chrome client. Defensive — harmless if the bridge is lenient. The MCP token-mint call hits `api.anthropic.com` and is already covered by the Origin-strip above.
+
+- **permissionStorage prune**: at startup, drops `duration:"once"` grant entries older than 24h from the bundle's `permissionStorage`. Once-grants are keyed to a single toolUseId and normally consumed on retry, but grants recorded against an `about:*` tab get `netloc:""` and can never match (plan approvals use `netloc:""` by design too) — they accumulated forever (observed: 51 dead entries). `always` entries are user choices and are never touched.
 
 - **Dynamic import**: At the very end, loads the minified ES-module service worker via `import('./assets/service-worker.ts-B5az7Lf2.js')`.
 
@@ -172,8 +184,30 @@ Hand-written classic (non-module) scripts that are loaded **before** the bundle 
   - Synthetic events (dispatched by the debugger CDP shim via `executeScript`) have `isTrusted === false` → allowed through
 - **Exceptions**: events whose target is inside `#claude-agent-stop-container`, `#claude-static-indicator-container`, or our injected `#__cz_stop_btn` are always allowed (user can stop the agent / use indicator controls)
 - **Injected Stop button (`#__cz_stop_btn`)**: driven ("static") tabs get no native stop button, so the blocker injects one. On click it resolves the session's **main tab via our registry** (`FF_RESOLVE_MAIN_TAB` → `firefox-threads.js`) and sends `STOP_AGENT` with that **numeric** `fromTabId` — bypassing the bundle's own `getMainTabId`, which can miss the mapping and then never abort. Falls back to the `CURRENT_TAB` sentinel if resolution fails.
+- **Agent-active DOM flag (`<html data-cz-agent="1">`)**: when blocking flips on/off, the blocker sets/removes `document.documentElement.dataset.czAgent`. This is a **cross-world channel** to the MAIN-world `firefox-dialog-tamer.js` (which can't receive `runtime` messages): ISOLATED and MAIN share the per-frame DOM, so the tamer reads this flag to know when the agent is driving. Set per-frame (the blocker runs in all frames).
 
 **Why capture phase?** The automation uses `document.elementFromPoint(x, y)` to find targets. A real overlay (`pointer-events: auto`) would be returned by `elementFromPoint` and Claude would "click" the overlay instead of the page.
+
+### `firefox-dialog-tamer.js`
+
+**Content script** injected into all pages (**MAIN world**, all frames, `document_start`).
+
+**Purpose**: Stop native JS dialogs (`alert`/`confirm`/`prompt`) and `beforeunload` from
+**blocking** agent automation — Firefox has no CDP `Page.handleJavaScriptDialog`, and these
+dialogs halt the page's JS thread synchronously, so a `confirm()` in a click handler or a
+`beforeunload` on navigation would hang the agent indefinitely.
+
+**Implementation**:
+- Native dialogs can't be intercepted from outside the page, so it overrides
+  `window.alert` (→ no-op), `confirm` (→ `true`), `prompt` (→ default/`''`) **in the page**,
+  matching the bundle's CDP default of accepting dialogs.
+- A capture-phase `beforeunload` listener calls `stopImmediatePropagation()` +
+  `preventDefault()` so the page's own handler (which would set `returnValue`) never runs.
+- **Gated on the agent being active** — only suppresses when `document.documentElement`
+  `.dataset.czAgent === '1'` (set by `firefox-input-blocker.js`); when the agent is idle it
+  delegates to the originals, so the user's own dialogs behave normally.
+- **Caveat**: browser-UI-initiated `beforeunload` (the user closing a tab) still prompts —
+  only agent-active dialogs are auto-handled.
 
 ### `offscreen.js`
 
@@ -216,9 +250,10 @@ After `update-from-store.ps1` patches them:
 | `chrome.tabs.ungroup(tabIds)` | Remove from registry; also native-ungroup tabs in `native:true` groups | `firefox-page-shims.js` |
 | `chrome.tabs.query({...})` | Overlaid: `groupId` from registry when Claude-managed, else native; `groupId` filter applied in-shim | `firefox-page-shims.js` |
 | `chrome.tabs.get(tabId)` | Overlaid: registry `groupId` first, else native | `firefox-page-shims.js` |
+| `tab.pendingUrl` (Chrome-only) | `tabs.create/update` wraps record the target URL; `tabs.get/query` overlay reports it as `url` while the native url is still `about:*` (kills the empty-host permission loop) | `firefox-page-shims.js` |
 | `chrome.tabGroups.*` | FF 139+: overlay native (`get/query/update/move`) with registry; FF ≤138: full stub via registry | `firefox-page-shims.js` |
 | `chrome.tabs.create({url:"chrome://newtab"})` / `chrome.windows.create(...)` | Strip the `chrome://newtab` URL (Firefox rejects it as illegal) → Firefox opens its native new tab | `firefox-page-shims.js` |
-| `chrome.debugger.attach/detach/sendCommand` | `browser.scripting.executeScript()` for mutations; `tabs.captureVisibleTab()` for screenshots | `firefox-page-shims.js` |
+| `chrome.debugger.attach/detach/sendCommand` | `browser.scripting.executeScript()` for mutations; `tabs.captureTab(tabId)` (fallback `captureVisibleTab`) for screenshots | `firefox-page-shims.js` |
 | `chrome.offscreen.createDocument()` | No-op (Firefox background is a real DOM page) | `firefox-page-shims.js` |
 | `chrome.offscreen.hasDocument()` | Returns `true` | `firefox-page-shims.js` |
 | `chrome.identity.launchWebAuthFlow()` | `browser.identity.launchWebAuthFlow()` (primary) or `manualTabAuth()` with webRequest interception (fallback) | `firefox-bg-loader.js` |
@@ -264,6 +299,43 @@ If the HTML patches aren't applied (or need manual refresh):
 1. Verify the `<script src="firefox-page-shims.js"></script>` tag is present before the bundle module script in `sidepanel.html`, `options.html`, `pairing.html`
 2. For `sidepanel.html`, ensure the bundle's script has `type="firefox-deferred-module"` (not `type="module"`)
 3. Verify no inline `<script>` blocks remain (CSP forbids them) — theme detection is now in the shim
+
+## Token Savers (read_page-first + screenshot downscale)
+
+Two Layer-2 knobs in `firefox-page-shims.js` to cut the agent's token spend. Both live
+in the shim, so they survive `update-from-store.ps1`. **Background**: the upstream agent is
+a vision-first computer-use loop and screenshots a lot; each screenshot is a base64 image
+costing roughly `width*height/750` tokens — the bulk of a session. But the bundle *already*
+ships cheap **text** observers, so the model rarely *needs* a screenshot:
+- `read_page` → `assets/accessibility-tree.js-*.js` (`__generateAccessibilityTree`): a
+  Playwright-style **accessibility tree** as text, with `ref_id` markers for clicking,
+  `interactive`/`all` filter, `depth`, viewport-clipping, password/`autocomplete` redaction.
+- `get_page_text` → page text. `find` → element finder (small-model helper).
+
+**1. Text-first steering (`__czPreferText`, default ON).** The `window.fetch` wrapper
+(`czSteerBody`) appends a short **system block** to each *agent* `/v1/messages` request
+telling the model to observe with `read_page`/`get_page_text`/`find` and screenshot only
+when it must see pixels (visual layout, canvas/video/images, or when text was insufficient).
+- Only the real agent request is touched — gated on the body carrying the browser tools
+  (`read_page`/`computer`/…), so the cosmetic title/status/find-helper `/messages` calls are
+  left alone. Idempotent via a `cz-token-saver` marker.
+- Appended **after** the bundle's own system blocks, so the cached prompt prefix still hits;
+  the extra block (~90 tokens, uncached) is negligible against one image.
+- Only the string-body-in-`init` path (the Anthropic SDK's path) is mutated; the
+  Request-object path is left unchanged (not used by the SDK).
+- Toggle: `czPreferText(false)` to disable, `czPreferText(true)` to re-enable.
+
+**2. Screenshot downscale (`__czShotScale`, default 1 = OFF).** Image tokens scale with
+**pixel count**, not file size — so lowering JPEG quality saves nothing; only fewer pixels
+do. `Page.captureScreenshot` captures via `tabs.captureTab(tabId, {scale:s})`; at `s<1` the
+image (and its token cost) shrinks ~`s²`. The model then picks click coords in that smaller
+space, so the scale actually used is recorded per tab (`__czShotScaleByTab`) and
+`Input.dispatchMouseEvent` **divides incoming coords by it** to map back to CSS pixels. The
+`captureVisibleTab` fallback has no `scale` param → it records `1` (clicks unscaled).
+- Coordinate remapping is the exact class of bug this port has fought (the "divide by DPR"
+  saga), so this is **opt-in**; the default `1` changes nothing. Wheel/scroll coords are not
+  remapped — a caveat at `s<1`.
+- Toggle: `czShotScale(0.5)` (clamped 0.3–1), `czShotScale(1)` to turn off.
 
 ## Debug Mode (Chat Mirror)
 
@@ -316,19 +388,36 @@ was added (layers 1–2; "continue a past chat" is a separate, pending decision)
   sanitized snapshot (base64 images dropped, blocks truncated) is persisted to
   `storage.local.__czChats` keyed by a `chatId`. The chatId **rotates** when the first user
   message changes (a "new chat") — tracked via `storage.session.__czChatCur`
-  (`tabId → chatId`). `czCaptureResponse` also appends the streamed assistant reply (the
-  one part the next request won't yet contain). Capture only runs in the sidepanel (it
-  needs the `?tabId=N` to attribute the chat).
+  (`tabId → chatId`). The signature **strips `<system-reminder>` blocks first**: the bundle
+  re-injects a live `availableTabs` reminder into the first user message on every request,
+  and tab titles inside it can change between turns (e.g. a quiz counting down
+  "Time Left: 00:55:31" in its title) — comparing raw text rotated the chatId every turn
+  and saved one conversation as ~30 growing duplicate snapshots. The `find` tool's internal
+  small-model helper calls ("You are helping find elements…") are filtered out via
+  `AUX_RE` alongside the status/title generators. `czCaptureResponse` also appends the
+  streamed assistant reply (the one part the next request won't yet contain). Capture only
+  runs in the sidepanel (it needs the `?tabId=N` to attribute the chat).
 - **Recent list + read-only viewer (`firefox-threads.js`)**: the switcher menu now has a
   **"Recent chats"** section (read from `__czChats`, newest first) that is shown **even
   with no open threads** (the post-restart case). A row opens a full-screen **read-only
   transcript viewer** (rendered via `self.czRenderChatMd`); 🗑 deletes a saved chat.
 - **Console helpers**: `czChats()` (list), `czChatExport(id)` (download `.md`),
   `czChatDelete(id)`.
-- **Not yet done — "continue" a past chat**: re-injecting history into the live bundle so
-  the agent keeps context. Two candidate approaches were scoped (hook the bundle's Zustand
-  store = seamless but fragile vs. re-seed via the public `EXECUTE_TASK` = robust but a new
-  session) — decision pending.
+- **Continue a past chat (DONE)**: re-seeds a saved transcript into the **live** bundle. The
+  upstream sidepanel reads `storage.local.test_data_messages` on mount (~100ms) and hydrates
+  it into its React/Zustand conversation store — a built-in, non-dev-gated seam. The
+  **"▶ Continue"** button (Recent rows + the viewer bar, `firefox-threads.js`) sends
+  `FF_CONTINUE_CHAT {chatId}`; the background converts `__czChats[chatId]` →
+  `self.czChatToStoreMessages(chat)` and writes that key, then the sidepanel
+  `location.replace(?tabId=…)` so the bundle re-runs and hydrates. **Conversion flattens
+  non-text blocks to text** (capture dropped `tool_use.id`/`tool_result.tool_use_id`/thinking
+  signatures/image sources — seeding them verbatim 400s the next request) and merges
+  consecutive same-role turns (the Messages API requires strict alternation); `lastReply` is
+  appended as the final assistant turn. **Target tab**: if the chat's original tab still maps
+  to a live thread the background returns its `mainTabId` (agent keeps acting on the same
+  tabs); else the current sidebar tab (post-restart → fresh group). The seed key is
+  **one-shot** — `firefox-page-shims.js` clears `test_data_messages` ~1.5s after mount so a
+  manual reload doesn't re-hydrate.
 
 ## Known Constraints / Gotchas
 
@@ -383,10 +472,15 @@ Native Firefox `chrome.tabs.group` (FF 139+) **rejects privileged/extension page
 - `accountUuid`: user's account UUID
 - `lastAuthFailureReason`: diagnostic
 - `__czDebugMirror`: boolean — enables the chat→console debug mirror (see Debug Mode)
+- `__czPreferText`: boolean (storage.local, default **true**) — text-first steering (see Token Savers); toggle `czPreferText(true/false)`
+- `__czShotScale`: number 0.3–1 (storage.local, default **1**=off) — screenshot downscale factor (see Token Savers); toggle `czShotScale(0.5)`
 - `__czSessionLog`: array — persistent ring-buffer debug log (see Debug Mode → Persistent session log); dump with `czDumpLog()`
 - `__czPreferEmulatedGroups`: boolean — manual override for grouping mode (`true`=force registry-only/emulated, `false`=force native, unset=auto-detect Zen). Set via `czEmulateGroups(true/false)`. See `docs/ZEN_TABS_AND_FOLDERS.md`
 - `__czChats`: object (storage.local) — saved chat transcripts keyed by chatId (see Previous chats); the bundle never persists conversations, so the capture layer does
 - `__czChatCur`: object (storage.session) — `tabId → current chatId` map for the capture rotation
+- `test_data_messages`: array (storage.local) — **bundle's own key**, repurposed by "Continue past chat": the upstream sidepanel hydrates the live conversation from it on mount. We write it (converted transcript) then clear it one-shot ~1.5s after mount
+- `bridgeDeviceId` / `bridgeDisplayName`: **bundle's own keys** — the MCP bridge's per-install device id + optional display name sent on the WS `connect` frame
+- `data-cz-agent` (not storage — a `<html>` dataset attribute): per-frame "agent is driving" flag set by `firefox-input-blocker.js`, read by the MAIN-world `firefox-dialog-tamer.js`
 
 ### Extension IDs
 
@@ -438,6 +532,18 @@ the sidebar shows. A **"thread" = one Claude group** in the registry
   it sets `?tabId=<mainTabId>` and `location.replace()`s, re-running the deferred-module
   loader for that thread (browser tabs are left untouched). Each row has a **⤴ "jump to
   tab"** button that focuses that thread's browser tab. Refreshes on `storage.onChanged`.
+- **"+ New thread"** (`newThread()`) — branches on whether the sidebar is already on a live
+  Claude thread (authoritative `FF_THREAD_MEMBERSHIP`, falling back to the in-memory
+  `currentThread()`):
+  - **On a thread** → a *fresh chat in the same thread*: it clears the Continue seed
+    (`test_data_messages`) and `location.reload()`s the sidebar on the **same** `?tabId`.
+    The bundle keeps the conversation only in volatile state, so a reload starts an empty
+    chat **without opening a new browser tab or a second tab group** (the existing group is
+    reused so the agent can still act). This replaced the old always-spawn behavior, which
+    opened a `duckduckgo.com` tab + made a new group on every click.
+  - **Not on a thread** (post-restart, or sidebar on a non-Claude tab) → `FF_NEW_THREAD`
+    adopts the current page (or opens a fresh tab if it's already a thread / privileged),
+    seeds it into a group, and the sidebar repoints to it.
 - **Background handlers** (`runtime.onMessage`, `FF_*`): `FF_THREAD_MEMBERSHIP` (is this
   tab in a Claude group?), `FF_RESOLVE_MAIN_TAB` (registry → the session's main tab, used
   by the input-blocker's Stop button), `FF_FOCUS_TAB` (`tabs.update`+`windows.update`), and
@@ -446,13 +552,37 @@ the sidebar shows. A **"thread" = one Claude group** in the registry
   `FF_FOCUS_TAB` / `FF_NEW_THREAD` act on a caller-supplied `tabId`, so they are **gated to
   extension-page senders** (sidepanel) — a content script / web page can't drive the
   user's tabs through them.
-- **Sidebar scoping** (`closeSidebarIfForeign`, on `tabs.onActivated` /
+- **Main-tab close / Zen window-move: resurrect-or-stop** (background `tabs.onRemoved` +
+  `onUpdated`): Chrome's per-tab side panel dies with its tab; Firefox's global sidebar
+  stays pinned to the dead `?tabId`, the bundle keeps running, every tool errors
+  ("Invalid tab ID: N", empty `availableTabs`), and the model spins retrying — each retry
+  re-sends the whole conversation (observed: a session ended on 9 back-to-back
+  `tabs_context` calls, pure token burn). Complication: **Zen recreates a tab with a NEW
+  id when it's dragged to another window** (stock Firefox preserves the id), so
+  `onRemoved` also fires for tabs the user merely moved. The handler stashes the removed
+  registry tab's `{url, gid, wasMain}` for a 2.5s grace window (registry read from a
+  **synchronous mirror** — page-shims' own `onRemoved` prunes `memb` concurrently): a tab
+  committing that exact URL inside the window is the same logical tab → **rebind** the
+  registry (`memb[newId]`, `meta.mainTabId`); driven tabs stay controllable seamlessly. A
+  moved/closed **main** tab still kills the live conversation (the bundle's session is
+  hard-bound to the old `?tabId`), so the handler sends `STOP_AGENT {fromTabId: oldId}`
+  (the injected Stop button's message) to abort the zombie run, and on a move also
+  broadcasts `FF_SWITCH_THREAD` so the sidebar repoints to the resurrected thread (fresh
+  chat; the old one is in Recent chats).
+- **Foreign-tab banner** (`broadcastForeign`/`isForeignTab`, on `tabs.onActivated` /
   `windows.onFocusChanged`): Firefox's sidebar is one **global** instance shown on every
-  tab/window. To keep it from lingering on unrelated pages, it is **closed** whenever the
-  active tab is neither the sidebar's **pinned tab** (`storage.session.__ffSidebarTab`) nor
-  a tab in the **same thread/group** as that pinned tab. It is **not** auto-reopened
-  (Firefox needs a live user gesture) — the user reopens with Ctrl+E. So the sidebar stays
-  "where you opened it / its own tab group" and disappears elsewhere.
+  tab/window, and the platform gives **no way to auto-close it** — `sidebarAction.close()`
+  *and* `open()` "may only be called from inside the handler for a user action" (MDN), so
+  calling `close()` from a tab-switch event always throws. (An earlier
+  `closeSidebarIfForeign` tried exactly that and silently failed every switch.) Instead the
+  chat is left **fully usable everywhere** and the background just **broadcasts**
+  `FF_ACTIVE_TAB {foreign}` whenever the active tab is neither the sidebar's **pinned tab**
+  (`storage.session.__ffSidebarTab`) nor in the **same thread/group** as it. The sidepanel
+  shows a slim non-blocking **banner** (`#cz-foreign-banner`: "Вы на другой вкладке… Claude
+  работает в своей вкладке", with a ⤴ jump-to-Claude-tab button) — the user can keep
+  replying and the agent keeps acting on its **own group's tabs** only, so other tabs are
+  undisturbed. To actually *hide* the sidebar the user presses Ctrl+E (Firefox's native
+  toggle). Auto-open on install/reload is disabled via `sidebar_action.open_at_install:false`.
 - **Content-script registration** — registers `firefox-thread-jump.js` dynamically via
   `scripting.registerContentScripts` (id `cz-thread-jump`), so no manifest
   `content_scripts` edit is needed.

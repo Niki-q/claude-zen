@@ -49,6 +49,12 @@
       "matches": [ "<all_urls>" ],
       "run_at": "document_start"
    }, {
+      "all_frames": true,
+      "js": [ "firefox-dialog-tamer.js" ],
+      "matches": [ "<all_urls>" ],
+      "run_at": "document_start",
+      "world": "MAIN"
+   }, {
       "all_frames": false,
       "js": [ "firefox-console-hook.js" ],
       "matches": [ "<all_urls>" ],
@@ -73,7 +79,7 @@
    "options_page": "options.html",
    "permissions": [
       "storage", "activeTab", "scripting",
-      "tabs", "tabGroups", "alarms", "notifications", "webNavigation",
+      "tabs", "tabGroups", "tabHide", "alarms", "notifications", "webNavigation",
       "declarativeNetRequest", "nativeMessaging",
       "unlimitedStorage", "downloads", "identity",
       "webRequest", "webRequestBlocking"
@@ -81,7 +87,8 @@
    "sidebar_action": {
       "default_panel": "sidepanel.html",
       "default_title": "Claude",
-      "default_icon": "icon-128.png"
+      "default_icon": "icon-128.png",
+      "open_at_install": false
    },
    "version": "1.0.72",
    "web_accessible_resources": [ {

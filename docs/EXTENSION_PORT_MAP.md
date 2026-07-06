@@ -14,13 +14,12 @@ companion files `docs/_findings_chrome.md` (original feature map) and `docs/_fin
 | Metric | Value |
 |---|---|
 | Distinct feature areas | 16 |
-| ✅ Fully working on Firefox | 11 |
-| 🟡 Partial / degraded | 4 (synthetic-input trust, screenshots, shadow DOM, JS dialogs) |
-| ❌ Not ported | 1 (native messaging / MCP desktop bridge) |
-| Agentic-surface functional coverage | **~90%** |
-| chrome.* APIs: native / shimmed / not-ported | 11 native · 6 shimmed · 1 not-ported |
-| Biggest remaining feature gap | **Visible native tab groups** (built, but stranded on `origin/firefox-tab-groups`) |
-| Branch verdict | `firefox-tab-groups` = unmerged, partially-stale experiment — cherry-pick, don't merge |
+| ✅ Fully working on Firefox | 13 (incl. native tab groups, background-tab screenshots, JS-dialog taming, MCP WebSocket bridge) |
+| 🟡 Partial / degraded | 2 (synthetic-input trust, closed shadow DOM) |
+| ❌ Not ported | 1 (native-messaging MCP host — needs OS-level install; the WS bridge is the code-only MCP transport) |
+| Agentic-surface functional coverage | **~95%** |
+| Biggest remaining gap | **Synthetic input is untrusted** (`isTrusted=false`) — inherent WebExtensions limit; now detected/surfaced, not silent |
+| Recent additions (2026-06) | Continue-past-chat, JS-dialog taming, untrusted-input detection, MCP WS-bridge port |
 
 ---
 
@@ -78,8 +77,9 @@ Legend: ✅ done · 🟡 partial · ❌ not ported
 | GIF export | offscreen `gif.js`/`gif.worker.js` | ✅ shimmed | Same offscreen-in-background-page mechanism + `downloads` |
 | OAuth / identity login | `chrome.identity.launchWebAuthFlow` | ✅ shimmed | oauth-bridge(MAIN)+relay(ISOLATED)→bg token exchange at `platform.claude.com/v1/oauth/token`; sidepanel via `FF_IDENTITY_LAUNCH` |
 | CORS 401 on `/v1/messages` | (Chrome SW sends no Origin) | ✅ shimmed | `firefox-bg-loader.js` strips `Origin`/`Referer` for `api.anthropic.com`; injects `anthropic-client-platform`/`-version` |
-| Native messaging / MCP bridge | `chrome.runtime.connectNative` | ❌ | No FF native host for `com.anthropic.claude_browser_extension`; degrades gracefully. Needs OS-level host install (not code-only) |
-| JS dialog handling | CDP `Page.javascriptDialogOpening` | ❌ | `handleJavaScriptDialog` is a no-op stub; FF can't answer native beforeunload dialogs programmatically |
+| MCP bridge (WebSocket relay) | `wss://bridge.claudeusercontent.com` (hosted relay to desktop Claude / Claude Code) | ✅ shimmed | `firefox-bg-loader.js` defines `ServiceWorkerGlobalScope` in the **background only** so the bundle's SW-gated `fn()`/`es()`/`Ie()` run (the relay never connected otherwise); WS-handshake `Origin` rewritten to the Chrome-extension origin. End-to-end needs a paired desktop companion |
+| Native messaging (MCP direct) | `chrome.runtime.connectNative` | ❌ | No FF native host for `com.anthropic.claude_browser_extension`; degrades gracefully. Needs OS-level host install (not code-only). The WS bridge above is the code-only MCP transport |
+| JS dialog handling | CDP `Page.javascriptDialogOpening` | ✅ shimmed | `firefox-dialog-tamer.js` (MAIN world) overrides `alert`/`confirm`/`prompt` + suppresses `beforeunload` **while the agent drives** (gated on `document.documentElement.dataset.czAgent`, set by the input-blocker), so native dialogs no longer block automation |
 | Managed policy / i18n / telemetry / keyboard cmd | `storage.managed` · `i18n/*` · `auto-track` · `commands` | ✅ native | All work on FF unchanged |
 
 ---
@@ -156,7 +156,7 @@ Base `f0b3d62` = Chrome snapshot. Mechanism detail from `03-firefox-port-session
 | `side_panel` | `sidebar_action.default_panel: "sidepanel.html"` |
 | — | `browser_specific_settings.gecko.id="claude-zen@firefox"`, `strict_min_version:"128.0"` |
 | permissions incl. `debugger`,`tabGroups`,`sidePanel`,`offscreen` | replaced/shimmed; permission set: `storage, activeTab, scripting, tabs, alarms, notifications, webNavigation, declarativeNetRequest, nativeMessaging, unlimitedStorage, downloads, identity, webRequest, webRequestBlocking` + `<all_urls>` |
-| content_scripts (bundle) | 8 entries: oauth-bridge(MAIN), oauth-relay(ISOLATED), bundle content-script, accessibility-tree, agent-visual-indicator, input-blocker(ISOLATED), console-hook(MAIN), console-relay(ISOLATED) |
+| content_scripts (bundle) | 9 entries: oauth-bridge(MAIN), oauth-relay(ISOLATED), bundle content-script, accessibility-tree, agent-visual-indicator, input-blocker(ISOLATED), dialog-tamer(MAIN), console-hook(MAIN), console-relay(ISOLATED) |
 
 ---
 
@@ -179,11 +179,12 @@ that onto current main, add the `tabGroups` permission, then retire the branch. 
 ## 7. Known limitations
 
 - **Native messaging** — needs an OS-level FF native host for `com.anthropic.claude_browser_extension`; not code-only. Degrades gracefully when absent.
-- **JS / beforeunload dialogs** — FF can't answer native dialogs programmatically; `handleJavaScriptDialog` is a no-op stub.
-- **Synthetic events untrusted** (`isTrusted=false`) — trusted-input-gated elements may ignore agent clicks/keys. No fix within WebExtensions.
+- **JS / beforeunload dialogs** — ✅ tamed in-page (`firefox-dialog-tamer.js`) while the agent drives. Native UI-initiated `beforeunload` (user closing a tab) still prompts — only agent-triggered dialogs are auto-handled.
+- **Synthetic events untrusted** (`isTrusted=false`) — trusted-input-gated elements may ignore agent clicks/keys. No fix within WebExtensions, but now **detected & surfaced**: failed clicks reject, and `insertText`/key deletes that don't land are logged (`PASTE-IGNORED`/`KEY-IGNORED`) or returned as a soft error.
+- **MCP bridge** — connects on Firefox now, but MCP tools only appear when a **desktop Claude / Claude Code** companion is paired through the same relay; end-to-end tool use can't be verified without that companion.
 - **`captureVisibleTab` visible-tab-only** — can't screenshot an arbitrary background target.
 - **Closed shadow roots** inaccessible in many contexts (open roots work).
-- **Tab groups on main are logical-only** — no visible tab-strip group (visible version stranded on branch).
+- **Tab groups** — ✅ visible native groups on FF 138+ (orange "Claude" title on 139+); registry emulation only as the privileged-tab / FF ≤137 / Zen fallback.
 - **Console/Network capture gated** — silent until the agent calls `Runtime.enable`; events before enable are missed.
 - **Sidebar can't be reopened programmatically** — FF `open()` needs a user gesture; port swaps content instead.
 
@@ -191,14 +192,17 @@ that onto current main, add the `tabGroups` permission, then retire the branch. 
 
 ## 8. Remaining / not-yet-ported (prioritized checklist)
 
-**High**
-- [ ] Port the branch's **hybrid native/visible tab groups** onto current main (native on FF 139+, `storage.session` fallback for privileged/FF≤138; registry = access-gate). Add `tabGroups` permission. Include the **new-tab URL fix** (unblocks `tabs_create`/`browser_batch`). Retire branch after.
-- [ ] **JS dialog / beforeunload handling** — investigate `beforeunload` suppression / `tabs.onUpdated` heuristics so automation doesn't hit a blocking native prompt.
+**Done (2026-06)**
+- [x] **Hybrid native/visible tab groups** — shipped to main (native FF 138+, orange title 139+, registry fallback). New-tab URL fix included.
+- [x] **Background-tab screenshots** — `Page.captureScreenshot` now uses `tabs.captureTab(tabId)` (captures the inactive target), `captureVisibleTab` only as fallback.
+- [x] **JS dialog / beforeunload taming** — `firefox-dialog-tamer.js` overrides dialogs + suppresses `beforeunload` while the agent drives.
+- [x] **Untrusted-input detection** — failed clicks reject; `insertText`/key-delete no-ops are logged / soft-errored so the model knows.
+- [x] **MCP WebSocket bridge** — `ServiceWorkerGlobalScope` background shim unblocks the relay; WS Origin rewritten.
+- [x] **Continue past chat** — re-seed a saved transcript into the live agent via `test_data_messages`.
 
-**Medium**
-- [ ] **Trusted input events** — at minimum detect/log failures where `isTrusted=false` breaks a site (drag/drop, paste).
-- [ ] **Background-tab screenshots** — add activate-then-capture fallback for `Page.captureScreenshot`.
+**Medium / remaining**
 - [ ] **Closed shadow roots** — route shadow/selector queries through the ISOLATED content world (where `openOrClosedShadowRoot` is available) instead of MAIN-world eval.
+- [ ] **MCP end-to-end verification** — confirm bridge tool relay with a real paired desktop Claude / Claude Code (needs the companion app; not verifiable in-repo).
 
 **Low**
 - [ ] **Native messaging** — ship FF native host `.json` + OS registration only if a feature needs the companion.

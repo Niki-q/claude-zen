@@ -11,6 +11,7 @@ $Protected = @(
     "firefox-page-shims.js",
     "firefox-threads.js",
     "firefox-thread-jump.js",
+    "firefox-dialog-tamer.js",
     "firefox-bg-loader.js",
     "firefox-oauth-bridge.js",
     "firefox-oauth-relay.js",

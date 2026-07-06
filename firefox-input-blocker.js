@@ -112,6 +112,14 @@
     const on = sessionOn || ttlOn;
     if (on !== active) {
       active = on;
+      // Publish agent-active as a shared-DOM flag so the MAIN-world dialog tamer
+      // (firefox-dialog-tamer.js) can gate on it — it can't receive runtime messages.
+      // Set per-frame (this script runs in all frames), readable by the MAIN-world tamer
+      // in the same frame.
+      try {
+        const de = document.documentElement;
+        if (de) { if (on) de.dataset.czAgent = '1'; else delete de.dataset.czAgent; }
+      } catch (e) {}
       for (const type of BLOCKED) {
         if (on) window.addEventListener(type, handler, { capture: true, passive: false });
         else window.removeEventListener(type, handler, { capture: true });
